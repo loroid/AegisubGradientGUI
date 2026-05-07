@@ -1,0 +1,35 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local virtual environments
+.venv/
+.venv-linux/
+venv/
+env/
+
+# PyInstaller output
+GradientGUI/build/
+GradientGUI/dist/
+*.spec.bak
+
+# Portable/release artifacts
+release/
+*.zip
+
+# Native runtime dependencies kept out of the development repository.
+# They are bundled only in portable release packages.
+GradientGUI/libmpv-2.dll
+GradientGUI/libass/
+GradientGUI/ffmpeg.exe
+
+# Local/debug artifacts
+*.gradient-debug.json
+gradient_gui_input.gradient-debug.json
+input.png
+*.log
+
+# Editor/system files
+.DS_Store
+Thumbs.db

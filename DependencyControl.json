@@ -1,0 +1,40 @@
+{
+  "dependencyControlFeedFormatVersion": "0.3.0",
+  "name": "Aegisub GradientGUI",
+  "description": "External visual gradient editor for Aegisub ASS subtitles.",
+  "maintainer": "Ioroid",
+  "baseUrl": "https://github.com/loroid/AegisubGradientGUI",
+  "url": "@{baseUrl}",
+  "fileBaseUrl": "https://raw.githubusercontent.com/loroid/AegisubGradientGUI/main/autoload/@{namespace}@{fileName}",
+  "macros": {
+    "Ioroid.GradientGUI": {
+      "url": "@{baseUrl}",
+      "author": "Ioroid",
+      "name": "Gradient GUI",
+      "description": "Launch external GradientGUI for real-time gradient editing. See the project page for setup.",
+      "channels": {
+        "release": {
+          "version": "1.0.0",
+          "released": "2026-05-06",
+          "default": true,
+          "platforms": [
+            "Windows-x64",
+            "Linux-x64"
+          ],
+          "files": [
+            {
+              "name": ".lua",
+              "url": "@{fileBaseUrl}",
+              "sha1": "656751CCD85557FC1B73813377C3EF38FCC8F16D"
+            }
+          ]
+        }
+      },
+      "changelog": {
+        "1.0.0": [
+          "Initial DependencyControl feed for the GradientGUI launcher."
+        ]
+      }
+    }
+  }
+}
