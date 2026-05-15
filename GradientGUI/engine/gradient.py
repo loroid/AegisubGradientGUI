@@ -258,10 +258,14 @@ def _color_shifted_strip_t(
     """Shift color t by discrete generated strip positions."""
 
     shift = _color_shift_for(settings, tag_name)
-    if abs(shift) < 1e-9 and not force_discrete:
-        return max(0.0, min(1.0, float(t)))
-
     slots = max(1, int(strip_slots))
+    if abs(shift) < 1e-9:
+        if not force_discrete:
+            return max(0.0, min(1.0, float(t)))
+        divisor = slots - 1 if include_endpoint and slots > 1 else slots
+        clamped_index = max(0.0, min(float(strip_index), float(divisor)))
+        return max(0.0, min(1.0, clamped_index / max(float(divisor), 1.0)))
+
     shifted_index = (float(strip_index) - shift) % float(slots)
     divisor = slots - 1 if include_endpoint and slots > 1 else slots
     shifted_t = shifted_index / max(float(divisor), 1.0)
@@ -507,8 +511,16 @@ def _generate_strips(
         and original_path_group_ranges
     )
     if use_group_original_path_strips:
-        original_path_loop_g_min = min(rng[0] for rng in original_path_group_ranges)
-        original_path_loop_g_max = max(rng[1] for rng in original_path_group_ranges)
+        # Sampled color ranges can be narrower than the final visible range when
+        # another enabled tag expands the subtitle, e.g. \bord in Vertical mode.
+        original_path_loop_g_min = min(
+            g_min,
+            *(rng[0] for rng in original_path_group_ranges),
+        )
+        original_path_loop_g_max = max(
+            g_max,
+            *(rng[1] for rng in original_path_group_ranges),
+        )
     else:
         original_path_loop_g_min = g_min
         original_path_loop_g_max = g_max
@@ -674,6 +686,7 @@ def _generate_strips(
                         strip_index,
                         color_shift_slots,
                         include_endpoint=path_sampling,
+                        force_discrete=original_path_sampling,
                     )
                     val = _get_interpolated_value(tag_name, cfg, tag_t, parsed, style, settings)
                 tag_str += build_tag_string(tag_name, val)
@@ -698,6 +711,7 @@ def _generate_strips(
                     strip_index,
                     color_shift_slots,
                     include_endpoint=path_sampling,
+                    force_discrete=original_path_sampling,
                 ),
             )
         except Exception as exc:
@@ -725,6 +739,7 @@ def _generate_strips(
                     strip_index,
                     color_shift_slots,
                     include_endpoint=path_sampling,
+                    force_discrete=original_path_sampling,
                 )
                 interp_pos = _get_interpolated_value(
                     "pos", enabled_tags["pos"], pos_t,

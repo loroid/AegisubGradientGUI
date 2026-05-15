@@ -127,6 +127,31 @@ class RenderRegressionTest(unittest.TestCase):
             self.ass,
         )
 
+    def _enable_saved_vertical_path_sampling(self, settings: GradientSettings) -> None:
+        settings.video_path = str(SAMPLE_VIDEO)
+        settings.sampling_paths = {"1c": "m 0 0 l 0 3"}
+        settings.sampling_path_samples = {
+            "1c": {
+                "paths": [{"ass_path": "m 0 0 l 0 3"}],
+                "sampled_colors": [
+                    [0, "0000FF"],
+                    [1, "00FF00"],
+                    [2, "FFFF00"],
+                    [3, "FF0000"],
+                ],
+            }
+        }
+        settings.path_sampling_smooth = {"1c": False}
+
+    def _enable_group_range_for_settings(self, settings: GradientSettings) -> None:
+        settings.group_range_bounds = (
+            self.base_bounds.x1,
+            self.base_bounds.y1,
+            self.base_bounds.x2,
+            self.base_bounds.y2,
+        )
+        settings.group_range_tags = set(settings.tags)
+
     def _event_with_tags(self, tag_text: str, remove_tags: tuple[str, ...]) -> ASSEvent:
         text = self.event.text
         for tag in remove_tags:
@@ -191,6 +216,70 @@ class RenderRegressionTest(unittest.TestCase):
             generated, (IMAGE_TYPE_CHARACTER, IMAGE_TYPE_OUTLINE)
         )
         self.assertGreaterEqual(render_union[3], self.base_bounds.y2 - 1.0)
+
+    def test_vertical_group_range_path_sampling_bord_growing_covers_outline(self) -> None:
+        settings = self._settings_for_configs(
+            [
+                self._config("1c", "0000FF", "FF0000"),
+                self._config("bord", 0, 10),
+            ],
+            mode=GradientMode.VERTICAL,
+        )
+        self._enable_saved_vertical_path_sampling(settings)
+        self._enable_group_range_for_settings(settings)
+
+        generated = self._generate_with_settings(settings)
+
+        reference = measure_event_bounds(
+            self.ass,
+            self._event_with_tags(r"\bord10", ("bord", "xbord", "ybord")),
+            image_types=(IMAGE_TYPE_CHARACTER, IMAGE_TYPE_OUTLINE),
+        )
+        self.assertIsNotNone(reference)
+        self.assertCovers(
+            self._clip_union(generated),
+            (reference.x1, reference.y1, reference.x2, reference.y2),
+        )
+        render_union = self._render_union(
+            generated, (IMAGE_TYPE_CHARACTER, IMAGE_TYPE_OUTLINE)
+        )
+        self.assertGreaterEqual(render_union[3], reference.y2 - 2.0)
+
+    def test_original_path_group_range_clamps_non_color_tags_past_their_range(self) -> None:
+        cases = [
+            ("fscx", 100, 150, r"\\fscx(-?[0-9.]+)", 150.0, 0.1),
+            ("fscy", 100, 150, r"\\fscy(-?[0-9.]+)", 150.0, 0.1),
+            ("fs", 80, 120, r"\\fs(-?[0-9.]+)", 120.0, 0.1),
+            ("fsp", 0, 20, r"\\fsp(-?[0-9.]+)", 20.0, 0.1),
+            ("fax", 0, 1, r"\\fax(-?[0-9.]+)", 1.0, 0.02),
+            ("fay", 0, 1, r"\\fay(-?[0-9.]+)", 1.0, 0.02),
+            ("frx", 0, 90, r"\\frx(-?[0-9.]+)", 90.0, 0.1),
+            ("fry", 0, 90, r"\\fry(-?[0-9.]+)", 90.0, 0.1),
+            ("frz", 0, 90, r"\\frz(-?[0-9.]+)", 90.0, 0.1),
+            ("blur", 0, 10, r"\\blur(-?[0-9.]+)", 10.0, 0.1),
+            ("be", 0, 10, r"\\be(-?[0-9.]+)", 10.0, 0.1),
+            ("shad", 0, 10, r"\\(?:xshad|yshad|shad)(-?[0-9.]+)", 10.0, 0.1),
+        ]
+        for tag, start, end, pattern, expected, delta in cases:
+            with self.subTest(tag=tag):
+                settings = self._settings_for_configs(
+                    [
+                        self._config("1c", "0000FF", "FF0000"),
+                        self._config("bord", 0, 10),
+                        self._config(tag, start, end),
+                    ],
+                    mode=GradientMode.VERTICAL,
+                )
+                self._enable_saved_vertical_path_sampling(settings)
+                self._enable_group_range_for_settings(settings)
+                generated = self._generate_with_settings(settings)
+                values = [
+                    float(match.group(1))
+                    for evt in generated[-3:]
+                    for match in re.finditer(pattern, evt.text)
+                ]
+                self.assertTrue(values, f"{tag} should be present in generated tail")
+                self.assertAlmostEqual(values[-1], expected, delta=delta)
 
     def test_sample_fixture_metadata_and_rendered_events_are_consistent(self) -> None:
         visible_events = [evt for evt in self.ass.events if not evt.comment]
