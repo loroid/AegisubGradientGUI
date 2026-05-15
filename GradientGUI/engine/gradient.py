@@ -532,6 +532,21 @@ def _generate_strips(
         else int(math.floor(color_shift_divisor + 1e-6)) + (1 if path_sampling else 0),
     )
 
+    original_path_visible_index_map: dict[int, int] = {}
+    original_path_visible_slots = max(1, original_path_strip_count)
+    if original_path_sampling:
+        span = max(original_path_loop_g_max - original_path_loop_g_min, 1.0)
+        visible_indices: list[int] = []
+        for idx in range(original_path_strip_count):
+            strip_g0 = original_path_loop_g_min + span * idx / original_path_strip_count
+            strip_g1 = original_path_loop_g_min + span * (idx + 1) / original_path_strip_count
+            clip_g0 = max(strip_g0, g_min) if use_group_original_path_strips else strip_g0
+            clip_g1 = min(strip_g1, g_max) if use_group_original_path_strips else strip_g1
+            if clip_g1 > clip_g0 + 1e-4:
+                original_path_visible_index_map[idx] = len(visible_indices)
+                visible_indices.append(idx)
+        original_path_visible_slots = max(1, len(visible_indices))
+
     def _shift_index_and_slots_for_tag(
         tag_name: str,
         axis_pos: float,
@@ -539,6 +554,16 @@ def _generate_strips(
         default_slots: int,
     ) -> tuple[int, int]:
         projected = group_projected_ranges.get(tag_name)
+        if use_group_original_path_strips:
+            if projected:
+                return default_index, max(1, original_path_strip_count)
+            local_index = original_path_visible_index_map.get(default_index)
+            if local_index is None:
+                local_index = max(
+                    0,
+                    min(int(default_index), original_path_visible_slots - 1),
+                )
+            return local_index, original_path_visible_slots
         if not projected:
             return default_index, default_slots
         rg_min, rg_max, _, _ = projected
@@ -625,6 +650,11 @@ def _generate_strips(
                 j += step
             continue
 
+        def _axis_pos_for_tag(tag_name: str) -> float:
+            if use_group_original_path_strips and tag_name in group_projected_ranges:
+                return j
+            return value_pos
+
         # Build override tags for this strip
         tag_str = ""
         for tag_name, cfg in enabled_tags.items():
@@ -632,41 +662,34 @@ def _generate_strips(
                 continue
             val = None
             try:
-                tag_t = _tag_t_for(tag_name, value_pos)
+                tag_axis_pos = _axis_pos_for_tag(tag_name)
+                tag_t = _tag_t_for(tag_name, tag_axis_pos)
                 if tag_name in sampling_data:
                     # Sampled color path
                     sd = sampling_data[tag_name]
                     if original_path_sampling and not sd.smooth:
-                        if tag_name in group_projected_ranges:
-                            c_range = max(sd.g_max - sd.g_min, 1.0)
-                            raw_t = max(0.0, min(1.0, (j - sd.g_min) / c_range))
-                            sample_index = int(round(raw_t * max(len(sd.keys) - 1, 0)))
-                            sample_t = _color_shifted_strip_t(
-                                0.0,
-                                settings,
-                                sample_index,
-                                max(len(sd.keys), 1),
-                                include_endpoint=True,
-                                force_discrete=True,
-                                tag_name=tag_name,
-                            )
-                        else:
-                            sample_t = _color_shifted_strip_t(
-                                0.0,
-                                settings,
-                                strip_index,
-                                color_shift_slots,
-                                include_endpoint=True,
-                                force_discrete=True,
-                                tag_name=tag_name,
-                            )
+                        sample_index, sample_slots = _shift_index_and_slots_for_tag(
+                            tag_name,
+                            tag_axis_pos,
+                            strip_index,
+                            color_shift_slots,
+                        )
+                        sample_t = _color_shifted_strip_t(
+                            0.0,
+                            settings,
+                            sample_index,
+                            sample_slots,
+                            include_endpoint=True,
+                            force_discrete=True,
+                            tag_name=tag_name,
+                        )
                     else:
                         c_range = max(sd.g_max - sd.g_min, 1)
-                        sample_t = (j - sd.g_min) / c_range
+                        sample_t = (tag_axis_pos - sd.g_min) / c_range
                         sample_t = _shifted_strip_t_for_tag(
                             tag_name,
                             sample_t,
-                            j,
+                            tag_axis_pos,
                             strip_index,
                             color_shift_slots,
                             include_endpoint=path_sampling,
@@ -682,7 +705,7 @@ def _generate_strips(
                     tag_t = _shifted_strip_t_for_tag(
                         tag_name,
                         tag_t,
-                        value_pos,
+                        tag_axis_pos,
                         strip_index,
                         color_shift_slots,
                         include_endpoint=path_sampling,
@@ -706,8 +729,8 @@ def _generate_strips(
                 settings,
                 lambda tag: _shifted_strip_t_for_tag(
                     tag,
-                    _tag_t_for(tag, value_pos),
-                    value_pos,
+                    _tag_t_for(tag, _axis_pos_for_tag(tag)),
+                    _axis_pos_for_tag(tag),
                     strip_index,
                     color_shift_slots,
                     include_endpoint=path_sampling,
@@ -732,10 +755,11 @@ def _generate_strips(
             interp_pos = None
             try:
                 base_pos = get_tag_value("pos", parsed, style)
+                pos_axis_pos = _axis_pos_for_tag("pos")
                 pos_t = _shifted_strip_t_for_tag(
                     "pos",
-                    _tag_t_for("pos", value_pos),
-                    value_pos,
+                    _tag_t_for("pos", pos_axis_pos),
+                    pos_axis_pos,
                     strip_index,
                     color_shift_slots,
                     include_endpoint=path_sampling,

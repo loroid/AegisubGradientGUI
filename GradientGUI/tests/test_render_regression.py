@@ -39,10 +39,17 @@ from engine.tag_parser import extract_clip_bounds, parse_tags_from_text, remove_
 
 SAMPLE_ASS = ROOT / "GradientGUI" / "tests" / "test.ass"
 SAMPLE_VIDEO = ROOT / "GradientGUI" / "tests" / "test.mp4"
-FFMPEG_EXE = (
-    ROOT.parent / "ffmpeg" / "ffmpeg.exe"
-    if os.name == "nt"
-    else shutil.which("ffmpeg")
+FFMPEG_EXE = next(
+    (
+        candidate
+        for candidate in (
+            ROOT.parent / "ffmpeg" / "ffmpeg.exe",
+            PROJECT_DIR / "ffmpeg.exe",
+            shutil.which("ffmpeg"),
+        )
+        if candidate and Path(candidate).exists()
+    ),
+    None,
 )
 
 
@@ -244,6 +251,34 @@ class RenderRegressionTest(unittest.TestCase):
             generated, (IMAGE_TYPE_CHARACTER, IMAGE_TYPE_OUTLINE)
         )
         self.assertGreaterEqual(render_union[3], reference.y2 - 2.0)
+
+    def test_original_path_group_range_respects_per_tag_disable_for_bord(self) -> None:
+        settings = self._settings_for_configs(
+            [
+                self._config("1c", "0000FF", "FF0000"),
+                self._config("bord", 0, 10),
+            ],
+            mode=GradientMode.VERTICAL,
+        )
+        self._enable_saved_vertical_path_sampling(settings)
+        height = self.base_bounds.y2 - self.base_bounds.y1
+        settings.group_range_bounds = (
+            self.base_bounds.x1,
+            self.base_bounds.y1 - height,
+            self.base_bounds.x2,
+            self.base_bounds.y2 + height,
+        )
+        settings.group_range_tags = {"1c"}
+
+        generated = self._generate_with_settings(settings)
+
+        bord_values = [
+            float(match.group(1))
+            for evt in generated
+            for match in re.finditer(r"\\bord(-?[0-9.]+)", evt.text)
+        ]
+        self.assertTrue(bord_values)
+        self.assertAlmostEqual(bord_values[0], 0.0, delta=0.05)
 
     def test_original_path_group_range_clamps_non_color_tags_past_their_range(self) -> None:
         cases = [
