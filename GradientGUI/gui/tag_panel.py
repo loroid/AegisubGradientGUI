@@ -11,9 +11,9 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
     QCheckBox, QLabel, QLineEdit, QPushButton, QFrame,
-    QDoubleSpinBox, QSpinBox, QColorDialog, QComboBox, QDialog,
+    QDoubleSpinBox, QSpinBox, QColorDialog, QComboBox, QDialog, QApplication,
 )
-from PySide6.QtCore import Qt, Signal, QRectF, QSize
+from PySide6.QtCore import Qt, Signal, QRectF, QSize, QTimer
 from PySide6.QtGui import QColor, QPixmap, QIcon, QGuiApplication, QPainter, QPen, QBrush
 
 from engine.tag_parser import TAG_INFO
@@ -48,6 +48,10 @@ class ScreenColorPicker(QWidget):
         self._screenshots = []
         self._hover_pos = None
         self._hover_color = QColor("#ffffff")
+        self._refreshing_screens = False
+        self._screen_refresh_timer = QTimer(self)
+        self._screen_refresh_timer.setSingleShot(True)
+        self._screen_refresh_timer.timeout.connect(self._refresh_screens_now)
 
         self._capture_screens()
         primary = QGuiApplication.primaryScreen()
@@ -68,6 +72,42 @@ class ScreenColorPicker(QWidget):
             pixmap = screen.grabWindow(0)
             self._screenshots.append((screen.geometry(), pixmap.toImage()))
 
+    def _refresh_screens_now(self):
+        if self._refreshing_screens:
+            return
+        self._refreshing_screens = True
+        mouse_grabbed = True
+        keyboard_grabbed = True
+        try:
+            try:
+                self.releaseMouse()
+            except Exception:
+                mouse_grabbed = False
+            try:
+                self.releaseKeyboard()
+            except Exception:
+                keyboard_grabbed = False
+            self.hide()
+            QApplication.processEvents()
+            self._capture_screens()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            if mouse_grabbed:
+                self.grabMouse()
+            if keyboard_grabbed:
+                self.grabKeyboard()
+            if self._hover_pos is not None:
+                color = self._sample_at(self._hover_pos, force_preview=True)
+                if color.isValid():
+                    self._hover_color = color
+                self.update()
+        finally:
+            self._refreshing_screens = False
+
+    def _schedule_screen_refresh(self):
+        self._screen_refresh_timer.start(35)
+
     def start(self):
         self.show()
         self.raise_()
@@ -80,7 +120,30 @@ class ScreenColorPicker(QWidget):
             return event.globalPosition().toPoint()
         return event.globalPos()
 
-    def _sample_at(self, global_pos) -> QColor:
+    def _sample_at(
+        self,
+        global_pos,
+        *,
+        force_preview: bool = False,
+        refresh_fallback: bool = False,
+    ) -> QColor:
+        parent_sampler = getattr(self._parent_window, "sample_preview_color_at_global_pos", None)
+        if callable(parent_sampler):
+            try:
+                color = parent_sampler(global_pos, force_preview)
+                if isinstance(color, QColor) and color.isValid():
+                    return color
+            except TypeError:
+                try:
+                    color = parent_sampler(global_pos)
+                except Exception:
+                    color = QColor()
+                if isinstance(color, QColor) and color.isValid():
+                    return color
+            except Exception:
+                pass
+        if refresh_fallback:
+            self._refresh_screens_now()
         for geometry, image in self._screenshots:
             if not geometry.contains(global_pos) or image.isNull():
                 continue
@@ -99,7 +162,7 @@ class ScreenColorPicker(QWidget):
 
     def mouseMoveEvent(self, event):
         self._hover_pos = self._event_global_pos(event)
-        color = self._sample_at(self._hover_pos)
+        color = self._sample_at(self._hover_pos, force_preview=True)
         if color.isValid():
             self._hover_color = color
         self.update()
@@ -107,7 +170,11 @@ class ScreenColorPicker(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            color = self._sample_at(self._event_global_pos(event))
+            color = self._sample_at(
+                self._event_global_pos(event),
+                force_preview=True,
+                refresh_fallback=True,
+            )
             if color.isValid():
                 self.color_picked.emit(color)
             self._finish()
@@ -116,6 +183,24 @@ class ScreenColorPicker(QWidget):
             self._finish()
         else:
             super().mousePressEvent(event)
+
+    def wheelEvent(self, event):
+        parent_zoom = getattr(self._parent_window, "zoom_preview_from_color_picker", None)
+        if callable(parent_zoom):
+            try:
+                delta = event.angleDelta().y()
+                if parent_zoom(self._event_global_pos(event), delta):
+                    event.accept()
+                    self._schedule_screen_refresh()
+                    if self._hover_pos is not None:
+                        color = self._sample_at(self._hover_pos, force_preview=True)
+                        if color.isValid():
+                            self._hover_color = color
+                    self.update()
+                    return
+            except Exception:
+                pass
+        super().wheelEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:

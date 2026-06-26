@@ -166,8 +166,7 @@ class RenderRegressionTest(unittest.TestCase):
         return replace(self.event, text=f"{{{tag_text}}}" + text)
 
     def _clip_union(self, events: list[ASSEvent]) -> tuple[float, float, float, float]:
-        rects = [extract_clip_bounds(evt.text) for evt in events]
-        rects = [rect for rect in rects if rect is not None]
+        rects = self._clip_rects(events)
         self.assertTrue(rects, "generated events should contain clip rectangles")
         return (
             min(r[0] for r in rects),
@@ -175,6 +174,13 @@ class RenderRegressionTest(unittest.TestCase):
             max(r[2] for r in rects),
             max(r[3] for r in rects),
         )
+
+    def _clip_rects(self, events: list[ASSEvent]) -> list[tuple[float, float, float, float]]:
+        return [
+            rect
+            for rect in (extract_clip_bounds(evt.text) for evt in events)
+            if rect is not None
+        ]
 
     def _render_union(
         self,
@@ -459,17 +465,207 @@ class RenderRegressionTest(unittest.TestCase):
         )
 
     def test_vertical_blur_growing_keeps_expanded_clip_envelope(self) -> None:
-        generated = self._generate("blur", 0, 10)
+        settings = self._settings("blur", 0, 10)
+        generated = self._generate_with_settings(settings)
+        plan = calculate_range_plan(
+            event=self.event,
+            ass_file=self.ass,
+            parsed=parse_tags_from_text(self.event.text),
+            style=self.style,
+            settings=settings,
+            enabled_tags=settings.tags,
+            base_rect=(
+                self.base_bounds.x1,
+                self.base_bounds.y1,
+                self.base_bounds.x2,
+                self.base_bounds.y2,
+            ),
+            source_clip_bounds=None,
+            geom_context=None,
+        )
+        expected = (plan.clip_rect[0], plan.g_min, plan.clip_rect[2], plan.g_max)
+        clip_union = self._clip_union(generated)
+        self.assertCovers(
+            clip_union,
+            expected,
+            tolerance=0.6,
+        )
+        self.assertInside(clip_union, expected, tolerance=0.6)
+
+    def test_vertical_high_blur_growing_keeps_full_clip_envelope(self) -> None:
+        settings = self._settings("blur", 0, 30)
+        generated = self._generate_with_settings(settings)
+        plan = calculate_range_plan(
+            event=self.event,
+            ass_file=self.ass,
+            parsed=parse_tags_from_text(self.event.text),
+            style=self.style,
+            settings=settings,
+            enabled_tags=settings.tags,
+            base_rect=(
+                self.base_bounds.x1,
+                self.base_bounds.y1,
+                self.base_bounds.x2,
+                self.base_bounds.y2,
+            ),
+            source_clip_bounds=None,
+            geom_context=None,
+        )
+        expected = (plan.clip_rect[0], plan.g_min, plan.clip_rect[2], plan.g_max)
+        clip_union = self._clip_union(generated)
+        self.assertCovers(
+            clip_union,
+            expected,
+            tolerance=0.6,
+        )
+        self.assertInside(clip_union, expected, tolerance=0.6)
+
+    def test_horizontal_blur_does_not_widen_strip_axis(self) -> None:
+        settings = self._settings("blur", 0, 10, mode=GradientMode.HORIZONTAL)
+        generated = self._generate_with_settings(settings)
+        rects = sorted(self._clip_rects(generated), key=lambda rect: rect[0])
+        self.assertGreater(len(rects), 2)
+        for previous, current in zip(rects, rects[1:]):
+            self.assertGreaterEqual(current[0], previous[2] - 1e-6)
+
+    def test_vertical_blur_does_not_widen_strip_axis(self) -> None:
+        settings = self._settings("blur", 0, 10, mode=GradientMode.VERTICAL)
+        generated = self._generate_with_settings(settings)
+        rects = sorted(self._clip_rects(generated), key=lambda rect: rect[1])
+        self.assertGreater(len(rects), 2)
+        for previous, current in zip(rects, rects[1:]):
+            self.assertGreaterEqual(current[1], previous[3] - 1e-6)
+
+    def test_static_high_blur_does_not_expand_fill_color_range(self) -> None:
+        blurred_event = self._event_with_tags(r"\blur24", ("blur",))
+        settings = self._settings("1c", "0000FF", "FF0000")
+        generated = self._generate_with_settings(settings, event=blurred_event)
+        expected = (
+            self.base_bounds.x1,
+            self.base_bounds.y1,
+            self.base_bounds.x2,
+            self.base_bounds.y2,
+        )
+        self.assertCovers(self._clip_union(generated), expected, tolerance=0.6)
+        self.assertInside(self._clip_union(generated), expected, tolerance=0.6)
+
+    def test_static_bord_blur_does_not_expand_fill_like_tag_ranges(self) -> None:
+        event = self._event_with_tags(r"\bord8\blur6", ("bord", "xbord", "ybord", "blur"))
+        group_bounds = (
+            self.base_bounds.x1 - 80.0,
+            self.base_bounds.y1 - 20.0,
+            self.base_bounds.x2 + 80.0,
+            self.base_bounds.y2 + 20.0,
+        )
+        for tag_name, start, end in (
+            ("1c", "0000FF", "FF0000"),
+            ("2c", "0000FF", "FF0000"),
+            ("1a", 0, 255),
+            ("2a", 0, 255),
+        ):
+            with self.subTest(tag=tag_name):
+                settings = self._settings(tag_name, start, end, mode=GradientMode.HORIZONTAL)
+                settings.group_range_bounds = group_bounds
+                settings.group_range_tags = {tag_name}
+                plan = calculate_range_plan(
+                    event=event,
+                    ass_file=self.ass,
+                    parsed=parse_tags_from_text(event.text),
+                    style=self.style,
+                    settings=settings,
+                    enabled_tags=settings.tags,
+                    base_rect=(
+                        self.base_bounds.x1,
+                        self.base_bounds.y1,
+                        self.base_bounds.x2,
+                        self.base_bounds.y2,
+                    ),
+                    source_clip_bounds=None,
+                    geom_context=None,
+                )
+                tag_range = plan.tag_projected_ranges[tag_name]
+                group_range = plan.group_projected_ranges[tag_name]
+                self.assertAlmostEqual(tag_range[0], group_bounds[0], places=4)
+                self.assertAlmostEqual(tag_range[1], group_bounds[2], places=4)
+                self.assertAlmostEqual(group_range[0], group_bounds[0], places=4)
+                self.assertAlmostEqual(group_range[1], group_bounds[2], places=4)
+
+    def test_static_bord_shadow_blur_still_expand_visible_effect_tag_ranges(self) -> None:
+        event = self._event_with_tags(
+            r"\bord8\xshad12\yshad10\blur6",
+            ("bord", "xbord", "ybord", "shad", "xshad", "yshad", "blur"),
+        )
+        group_bounds = (
+            self.base_bounds.x1,
+            self.base_bounds.y1,
+            self.base_bounds.x2,
+            self.base_bounds.y2,
+        )
+        for tag_name, start, end in (
+            ("3c", "0000FF", "FF0000"),
+            ("4c", "0000FF", "FF0000"),
+            ("blur", 6, 6),
+            ("alpha", 0, 0),
+        ):
+            with self.subTest(tag=tag_name):
+                settings = self._settings(tag_name, start, end, mode=GradientMode.HORIZONTAL)
+                settings.group_range_bounds = group_bounds
+                settings.group_range_tags = {tag_name}
+                plan = calculate_range_plan(
+                    event=event,
+                    ass_file=self.ass,
+                    parsed=parse_tags_from_text(event.text),
+                    style=self.style,
+                    settings=settings,
+                    enabled_tags=settings.tags,
+                    base_rect=(
+                        self.base_bounds.x1,
+                        self.base_bounds.y1,
+                        self.base_bounds.x2,
+                        self.base_bounds.y2,
+                    ),
+                    source_clip_bounds=None,
+                    geom_context=None,
+                )
+                group_range = plan.group_projected_ranges[tag_name]
+                self.assertLess(group_range[0], group_bounds[0])
+                self.assertGreater(group_range[1], group_bounds[2])
+
+    def test_static_bord_blur_noop_blur_gradient_keeps_outline_range(self) -> None:
+        event = self._event_with_tags(r"\bord8\blur6", ("bord", "xbord", "ybord", "blur"))
+        settings = self._settings("blur", 6, 6, mode=GradientMode.HORIZONTAL)
+        generated = self._generate_with_settings(settings, event=event)
         reference = measure_event_bounds(
             self.ass,
-            self._event_with_tags(r"\blur10", ("blur",)),
+            event,
             image_types=(IMAGE_TYPE_CHARACTER, IMAGE_TYPE_OUTLINE),
         )
         self.assertIsNotNone(reference)
+        reference_rect = (reference.x1, reference.y1, reference.x2, reference.y2)
+        self.assertCovers(self._clip_union(generated), reference_rect, tolerance=2.0)
         self.assertCovers(
-            self._clip_union(generated),
-            (reference.x1, reference.y1, reference.x2, reference.y2),
-            tolerance=3.0,
+            self._render_union(generated, (IMAGE_TYPE_CHARACTER, IMAGE_TYPE_OUTLINE)),
+            reference_rect,
+            tolerance=2.0,
+        )
+
+    def test_angled_static_bord_blur_noop_blur_gradient_keeps_outline_range(self) -> None:
+        event = self._event_with_tags(r"\bord8\blur6", ("bord", "xbord", "ybord", "blur"))
+        settings = self._settings("blur", 6, 6, mode=GradientMode.ANGLED)
+        settings.angle = 37.0
+        generated = self._generate_with_settings(settings, event=event)
+        reference = measure_event_bounds(
+            self.ass,
+            event,
+            image_types=(IMAGE_TYPE_CHARACTER, IMAGE_TYPE_OUTLINE),
+        )
+        self.assertIsNotNone(reference)
+        reference_rect = (reference.x1, reference.y1, reference.x2, reference.y2)
+        self.assertCovers(self._clip_union(generated), reference_rect, tolerance=8.0)
+        self.assertCovers(
+            self._render_union(generated, (IMAGE_TYPE_CHARACTER, IMAGE_TYPE_OUTLINE)),
+            reference_rect,
+            tolerance=8.0,
         )
 
     def test_angled_group_range_with_extent_tags_renders_visible_pixels(self) -> None:
@@ -760,6 +956,52 @@ class RenderRegressionTest(unittest.TestCase):
         self.assertLess(len(generated), len(keys))
         self.assertNotIn(r"\1c&H000001&", generated[0].text)
         self.assertNotIn(r"\1c&H000007&", generated[-1].text)
+
+    def test_unsmoothed_path_sampling_group_skip_keeps_only_intersecting_strips(self) -> None:
+        event = self._event_with_tags(r"\blur6", ("blur",))
+        settings = self._settings("1c", "0000FF", "FF0000", mode=GradientMode.HORIZONTAL)
+        settings.step = 25.0
+        settings.video_path = str(SAMPLE_VIDEO)
+        settings.sampling_paths = {"1c": "m 0 0 l 9 0"}
+        settings.sampling_path_samples = {
+            "1c": {
+                "paths": [{"ass_path": "m 0 0 l 9 0"}],
+                "sampled_colors": [[idx, f"{idx:06X}"] for idx in range(10)],
+            }
+        }
+        settings.path_sampling_smooth = {"1c": False}
+        width = self.base_bounds.x2 - self.base_bounds.x1
+        settings.group_range_bounds = (
+            self.base_bounds.x1 - width,
+            self.base_bounds.y1,
+            self.base_bounds.x2 + width,
+            self.base_bounds.y2,
+        )
+        settings.group_range_tags = {"1c"}
+
+        generated = self._generate_with_settings(settings, event=event)
+        plan = calculate_range_plan(
+            event=event,
+            ass_file=self.ass,
+            parsed=parse_tags_from_text(event.text),
+            style=self.style,
+            settings=settings,
+            enabled_tags=settings.tags,
+            base_rect=(
+                self.base_bounds.x1,
+                self.base_bounds.y1,
+                self.base_bounds.x2,
+                self.base_bounds.y2,
+            ),
+            source_clip_bounds=None,
+            geom_context=None,
+        )
+        rects = self._clip_rects(generated)
+        self.assertGreater(len(rects), 0)
+        self.assertLess(len(generated), 10)
+        for rect in rects:
+            self.assertGreater(rect[2], plan.g_min - 1e-6)
+            self.assertLess(rect[0], plan.g_max + 1e-6)
 
     def test_shifted_path_sampling_uses_group_range_phase(self) -> None:
         import engine.gradient as gradient_module

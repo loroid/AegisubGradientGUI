@@ -1394,6 +1394,50 @@ class MainWindow(QMainWindow):
             return True
         return self._path_frame_sampler.load_frame(video_path, self._current_video_time(evt))
 
+    def _ensure_color_picker_frame(self, *, force_load: bool = False) -> bool:
+        video_path = self._resolve_video_path()
+        evt = self._get_active_event()
+        if not video_path or not evt:
+            return False
+        marker = (str(video_path), int(self._current_preview_video_frame()))
+        if (
+            getattr(self, "_color_picker_frame_marker", None) == marker
+            and self._path_frame_sampler.image_size()
+        ):
+            return True
+        if not force_load:
+            return False
+        if getattr(self, "_color_picker_frame_failed_marker", None) == marker:
+            return False
+        if self._load_path_preview_frame(video_path, evt):
+            self._color_picker_frame_marker = marker
+            self._color_picker_frame_failed_marker = None
+            return True
+        self._color_picker_frame_failed_marker = marker
+        return False
+
+    def sample_preview_color_at_global_pos(self, global_pos, force_load: bool = False) -> QColor:
+        if not hasattr(self, "_video") or not self._video.contains_global_point(global_pos):
+            return QColor()
+        if not self._ensure_color_picker_frame(force_load=force_load):
+            return QColor()
+        frame_size = self._path_frame_sampler.image_size()
+        pixel = self._video.map_global_to_video_pixel(global_pos, frame_size)
+        if pixel is None:
+            return QColor()
+        bgr = self._path_frame_sampler.get_pixel_bgr(pixel[0], pixel[1])
+        if not bgr or len(bgr) < 6:
+            return QColor()
+        try:
+            return QColor(int(bgr[4:6], 16), int(bgr[2:4], 16), int(bgr[0:2], 16))
+        except ValueError:
+            return QColor()
+
+    def zoom_preview_from_color_picker(self, global_pos, delta: int) -> bool:
+        if not hasattr(self, "_video") or not self._video.contains_global_point(global_pos):
+            return False
+        return self._video.adjust_zoom_by_wheel_delta(int(delta))
+
     def _preview_fps(self) -> float:
         try:
             fps = float(self._video._player.container_fps)

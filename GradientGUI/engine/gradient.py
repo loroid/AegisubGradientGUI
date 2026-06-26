@@ -629,7 +629,10 @@ def _generate_strips(
             span = max(original_path_loop_g_max - original_path_loop_g_min, 1.0)
             j = original_path_loop_g_min + span * strip_index / original_path_strip_count
             strip_g1 = original_path_loop_g_min + span * (strip_index + 1) / original_path_strip_count
-            if use_group_original_path_strips and (strip_g1 <= g_min + 1e-6 or j >= g_max - 1e-6):
+            if use_group_original_path_strips and (
+                strip_g1 <= g_min + 1e-6
+                or j >= g_max - 1e-6
+            ):
                 strip_index += 1
                 continue
         else:

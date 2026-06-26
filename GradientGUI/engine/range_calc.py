@@ -24,6 +24,7 @@ from .tag_parser import (
     get_bord_sizes,
     get_shad_offsets,
     get_tag_value,
+    parse_tags_from_text,
     remove_specific_tag,
     strip_tags,
 )
@@ -36,11 +37,15 @@ ProjectedRange = tuple[float, float, float, float]
 GEOMETRY_TAGS = ("fscx", "fscy", "fs", "fsp", "fax", "fay", "frx", "fry", "frz")
 BORDER_SIZE_TAGS = ("bord", "xbord", "ybord")
 SHADOW_TAGS = ("shad", "xshad", "yshad")
+FILL_RANGE_TAGS = ("1c", "2c", "1a", "2a")
 EXTENT_EXPANDING_TAGS = BORDER_SIZE_TAGS + SHADOW_TAGS + ("blur", "be")
 VISIBLE_RANGE_TAGS = GEOMETRY_TAGS + (
     *BORDER_SIZE_TAGS, *SHADOW_TAGS,
-    "alpha", "1a", "2a", "3a", "4a",
+    "alpha", "3a", "4a",
     "blur", "be",
+)
+WHOLE_VISIBLE_TAGS = GEOMETRY_TAGS + BORDER_SIZE_TAGS + SHADOW_TAGS + (
+    "alpha", "blur", "be",
 )
 
 
@@ -65,16 +70,19 @@ class EffectExtents:
     max_xshad: float = 0.0
     min_yshad: float = 0.0
     max_yshad: float = 0.0
+    max_blur_pad: float = 0.0
     has_border: bool = False
     has_shadow: bool = False
+    has_blur: bool = False
 
     def expand_for_enabled(self, rect: Rect) -> Rect:
-        expanded = rect
-        if self.has_border:
-            expanded = self.expand_for_border(expanded)
         if self.has_shadow:
-            expanded = self.expand_for_shadow(expanded)
-        return expanded
+            return self.expand_for_shadow(rect)
+        if self.has_border:
+            return self.expand_for_border(rect)
+        if self.has_blur:
+            return self.expand_for_blur(rect)
+        return rect
 
     def expand_for_tag(self, tag_name: str, rect: Rect) -> Rect:
         if tag_name == "alpha":
@@ -83,34 +91,43 @@ class EffectExtents:
             return self.expand_for_border(rect)
         if tag_name in ("4c", "4a", *SHADOW_TAGS):
             return self.expand_for_shadow(rect)
+        if tag_name in ("blur", "be"):
+            return self.expand_for_alpha(rect)
         return rect
 
     def expand_for_alpha(self, rect: Rect) -> Rect:
         rx1, ry1, rx2, ry2 = rect
         return (
-            min(rx1, rx1 - self.max_xbord, rx1 - self.max_xbord + self.min_xshad),
-            min(ry1, ry1 - self.max_ybord, ry1 - self.max_ybord + self.min_yshad),
-            max(rx2, rx2 + self.max_xbord, rx2 + self.max_xbord + self.max_xshad),
-            max(ry2, ry2 + self.max_ybord, ry2 + self.max_ybord + self.max_yshad),
+            min(rx1, rx1 - self.max_xbord, rx1 - self.max_xbord + self.min_xshad) - self.max_blur_pad,
+            min(ry1, ry1 - self.max_ybord, ry1 - self.max_ybord + self.min_yshad) - self.max_blur_pad,
+            max(rx2, rx2 + self.max_xbord, rx2 + self.max_xbord + self.max_xshad) + self.max_blur_pad,
+            max(ry2, ry2 + self.max_ybord, ry2 + self.max_ybord + self.max_yshad) + self.max_blur_pad,
         )
 
     def expand_for_border(self, rect: Rect) -> Rect:
         rx1, ry1, rx2, ry2 = rect
         return (
-            rx1 - self.max_xbord,
-            ry1 - self.max_ybord,
-            rx2 + self.max_xbord,
-            ry2 + self.max_ybord,
+            rx1 - self.max_xbord - self.max_blur_pad,
+            ry1 - self.max_ybord - self.max_blur_pad,
+            rx2 + self.max_xbord + self.max_blur_pad,
+            ry2 + self.max_ybord + self.max_blur_pad,
         )
 
     def expand_for_shadow(self, rect: Rect) -> Rect:
         rx1, ry1, rx2, ry2 = rect
         return (
-            rx1 - self.max_xbord + self.min_xshad,
-            ry1 - self.max_ybord + self.min_yshad,
-            rx2 + self.max_xbord + self.max_xshad,
-            ry2 + self.max_ybord + self.max_yshad,
+            rx1 - self.max_xbord + self.min_xshad - self.max_blur_pad,
+            ry1 - self.max_ybord + self.min_yshad - self.max_blur_pad,
+            rx2 + self.max_xbord + self.max_xshad + self.max_blur_pad,
+            ry2 + self.max_ybord + self.max_yshad + self.max_blur_pad,
         )
+
+    def expand_for_blur(self, rect: Rect) -> Rect:
+        if self.max_blur_pad <= 0:
+            return rect
+        rx1, ry1, rx2, ry2 = rect
+        pad = self.max_blur_pad
+        return rx1 - pad, ry1 - pad, rx2 + pad, ry2 + pad
 
 
 @dataclass
@@ -150,6 +167,7 @@ class RangePlan:
     source_clip_bounds: Optional[Rect] = None
     needs_rendered_range: bool = False
     range_source: str = "expanded"
+    blur_pad: float = 0.0
     debug: RangeDebug = field(default_factory=RangeDebug)
 
     @property
@@ -211,6 +229,9 @@ def compute_effect_extents(
 ) -> EffectExtents:
     base_xbord, base_ybord = get_bord_sizes(event_text, style)
     base_xshad, base_yshad = get_shad_offsets(event_text, style)
+    parsed = parse_tags_from_text(event_text)
+    base_blur = max(0.0, float(parsed.get("blur", 0.0) or 0.0))
+    base_be = max(0.0, float(parsed.get("be", 0.0) or 0.0))
 
     def tag_min_max(
         tag_name: str,
@@ -235,20 +256,39 @@ def compute_effect_extents(
     shad_min, shad_max = tag_min_max("shad", base_xshad)
     xshad_min, xshad_max = tag_min_max("xshad", base_xshad)
     yshad_min, yshad_max = tag_min_max("yshad", base_yshad)
+    blur_min, blur_max = tag_min_max("blur", base_blur, min_value=0.0)
+    be_min, be_max = tag_min_max("be", base_be, min_value=0.0)
+    del blur_min, be_min
+    blur_pad = max(0.0, blur_max * 1.5, be_max * 2.0)
+
+    max_xbord = max(bord_max, xbord_max)
+    max_ybord = max(bord_max, ybord_max)
+    min_xshad = min(shad_min, xshad_min)
+    max_xshad = max(shad_max, xshad_max)
+    min_yshad = min(shad_min, yshad_min)
+    max_yshad = max(shad_max, yshad_max)
+    whole_visible_enabled = any(t in enabled_tags for t in WHOLE_VISIBLE_TAGS)
+    static_border_visible = max(max_xbord, max_ybord) > 1e-6
+    static_shadow_visible = any(
+        abs(v) > 1e-6
+        for v in (min_xshad, max_xshad, min_yshad, max_yshad)
+    )
 
     return EffectExtents(
-        max_xbord=max(bord_max, xbord_max),
-        max_ybord=max(bord_max, ybord_max),
-        min_xshad=min(shad_min, xshad_min),
-        max_xshad=max(shad_max, xshad_max),
-        min_yshad=min(shad_min, yshad_min),
-        max_yshad=max(shad_max, yshad_max),
+        max_xbord=max_xbord,
+        max_ybord=max_ybord,
+        min_xshad=min_xshad,
+        max_xshad=max_xshad,
+        min_yshad=min_yshad,
+        max_yshad=max_yshad,
+        max_blur_pad=blur_pad,
         has_border=any(
             t in enabled_tags for t in ("3c", "3a", "bord", "xbord", "ybord")
-        ),
+        ) or (whole_visible_enabled and static_border_visible),
         has_shadow=any(
             t in enabled_tags for t in ("4c", "4a", "shad", "xshad", "yshad")
-        ),
+        ) or (whole_visible_enabled and static_shadow_visible),
+        has_blur=blur_pad > 0.0 and whole_visible_enabled,
     )
 
 
@@ -337,12 +377,17 @@ def calculate_range_plan(
             range_source = "libass"
         debug.add("libass_range", range=rendered_range)
 
+    enabled_extent_tags = {tag for tag in enabled_tags if tag in EXTENT_EXPANDING_TAGS}
+    can_refine_axis_range = (
+        not enabled_extent_tags
+        or enabled_extent_tags.issubset({"blur", "be"})
+    )
     if (
         ass_file is not None
         and direction.is_axis_aligned
         and needs_rendered_range
         and source_clip_bounds is None
-        and not any(tag in enabled_tags for tag in EXTENT_EXPANDING_TAGS)
+        and can_refine_axis_range
     ):
         g_min, g_max, p_min, p_max = event_range
         for _ in range(4):
@@ -365,6 +410,11 @@ def calculate_range_plan(
         tag_name: event_range
         for tag_name in enabled_tags
     }
+    if not any(tag in enabled_tags for tag in GEOMETRY_TAGS):
+        fill_range = project_bounds(*base_rect, direction.cos_a, direction.sin_a)
+        for tag_name in enabled_tags:
+            if tag_name in FILL_RANGE_TAGS:
+                tag_projected_ranges[tag_name] = fill_range
     tag_projected_ranges.update(group_projected_ranges)
 
     plan = RangePlan(
@@ -380,6 +430,7 @@ def calculate_range_plan(
         source_clip_bounds=source_clip_bounds,
         needs_rendered_range=needs_rendered_range,
         range_source=range_source,
+        blur_pad=extents.max_blur_pad,
         debug=debug,
     )
     debug.add(
@@ -653,7 +704,7 @@ def compute_libass_projected_range(
     cos_a: float,
     sin_a: float,
 ) -> Optional[ProjectedRange]:
-    image_types = measurement_image_types(enabled_tags)
+    image_types = measurement_image_types(enabled_tags, parsed, style)
 
     def project_bounds_at(t: float) -> Optional[ProjectedRange]:
         measured_event = event_with_interpolated_geometry(
@@ -729,7 +780,7 @@ def refine_libass_axis_range_with_strips(
     strip_count = max(1, int(math.ceil(span / step)))
     last_idx = strip_count - 1
     cache: dict[int, bool] = {}
-    image_types = measurement_image_types(enabled_tags)
+    image_types = measurement_image_types(enabled_tags, parsed, style)
 
     if is_vert:
         x_from_p1 = -p_min * sin_a
@@ -825,11 +876,37 @@ def refine_libass_axis_range_with_strips(
     return refined_min, refined_max
 
 
-def measurement_image_types(enabled_tags: dict[str, Any]) -> tuple[int, ...]:
+def measurement_image_types(
+    enabled_tags: dict[str, Any],
+    parsed: Optional[dict] = None,
+    style: Optional[ASSStyle] = None,
+) -> tuple[int, ...]:
     image_types = {IMAGE_TYPE_CHARACTER}
+    parsed = parsed or {}
+    style_bord = style.outline if style else 0.0
+    bord = parsed.get("bord")
+    xbord = parsed.get("xbord", bord if bord is not None else style_bord)
+    ybord = parsed.get("ybord", bord if bord is not None else style_bord)
+    style_shad = style.shadow if style else 0.0
+    shad = parsed.get("shad")
+    xshad = parsed.get("xshad", shad if shad is not None else style_shad)
+    yshad = parsed.get("yshad", shad if shad is not None else style_shad)
+    try:
+        has_static_outline = max(float(xbord), float(ybord)) > 1e-6
+    except (TypeError, ValueError):
+        has_static_outline = False
+    try:
+        has_static_shadow = abs(float(xshad)) > 1e-6 or abs(float(yshad)) > 1e-6
+    except (TypeError, ValueError):
+        has_static_shadow = False
+    whole_visible_enabled = any(tag in enabled_tags for tag in WHOLE_VISIBLE_TAGS)
     if any(t in enabled_tags for t in ("alpha", "3c", "3a", "bord", "xbord", "ybord")):
         image_types.add(IMAGE_TYPE_OUTLINE)
+    elif whole_visible_enabled and has_static_outline:
+        image_types.add(IMAGE_TYPE_OUTLINE)
     if any(t in enabled_tags for t in ("alpha", "4c", "4a", "shad", "xshad", "yshad")):
+        image_types.add(IMAGE_TYPE_SHADOW)
+    elif whole_visible_enabled and has_static_shadow:
         image_types.add(IMAGE_TYPE_SHADOW)
     return tuple(sorted(image_types))
 

@@ -437,6 +437,76 @@ class VideoPreview(QWidget):
         self._debug_overlay.setGeometry(0, 0, w, h)
         self._placeholder.raise_()
 
+    def _virtual_surface_rect(self) -> tuple[float, float, float, float]:
+        if not self._uses_render_api_surface():
+            geometry = self._surface.geometry()
+            return (
+                float(geometry.x()),
+                float(geometry.y()),
+                max(1.0, float(geometry.width())),
+                max(1.0, float(geometry.height())),
+            )
+        w = max(float(self.width()), 1.0)
+        h = max(float(self.height()), 1.0)
+        scale = max(0.25, min(16.0, 2.0 ** self._video_zoom))
+        sw = max(1.0, w * scale)
+        sh = max(1.0, h * scale)
+        x = (w - sw) / 2.0 + self._video_pan_x * w / 2.0
+        y = (h - sh) / 2.0 + self._video_pan_y * h / 2.0
+        return x, y, sw, sh
+
+    def contains_global_point(self, global_pos) -> bool:
+        point = global_pos.toPoint() if hasattr(global_pos, "toPoint") else global_pos
+        return self.rect().contains(self.mapFromGlobal(point))
+
+    def adjust_zoom_by_wheel_delta(self, delta: int) -> bool:
+        if not self._player:
+            return False
+        if int(delta) == 0:
+            return False
+        self._video_zoom = max(-2.0, min(4.0, self._video_zoom + int(delta) / 1200.0))
+        self._apply_video_view()
+        return True
+
+    def map_global_to_video_pixel(
+        self,
+        global_pos,
+        frame_size: tuple[int, int],
+    ) -> Optional[tuple[int, int]]:
+        """Map a screen point on the zoomed preview to an original video pixel."""
+        if not frame_size or frame_size[0] <= 0 or frame_size[1] <= 0:
+            return None
+        point = global_pos.toPoint() if hasattr(global_pos, "toPoint") else global_pos
+        local = self.mapFromGlobal(point)
+        if not self.rect().contains(local):
+            return None
+
+        sx, sy, sw, sh = self._virtual_surface_rect()
+        lx = float(local.x()) - sx
+        ly = float(local.y()) - sy
+        if lx < 0.0 or ly < 0.0 or lx > sw or ly > sh:
+            return None
+
+        frame_w, frame_h = int(frame_size[0]), int(frame_size[1])
+        frame_aspect = frame_w / max(float(frame_h), 1.0)
+        surface_aspect = sw / max(sh, 1.0)
+        if surface_aspect > frame_aspect:
+            content_h = sh
+            content_w = content_h * frame_aspect
+        else:
+            content_w = sw
+            content_h = content_w / frame_aspect
+        content_x = (sw - content_w) / 2.0
+        content_y = (sh - content_h) / 2.0
+        vx = lx - content_x
+        vy = ly - content_y
+        if vx < 0.0 or vy < 0.0 or vx > content_w or vy > content_h:
+            return None
+
+        px = int(max(0, min(frame_w - 1, round((vx / max(content_w, 1.0)) * (frame_w - 1)))))
+        py = int(max(0, min(frame_h - 1, round((vy / max(content_h, 1.0)) * (frame_h - 1)))))
+        return px, py
+
     def _event_pos(self, event):
         if hasattr(event, "globalPosition"):
             return event.globalPosition()
@@ -472,9 +542,10 @@ class VideoPreview(QWidget):
         if delta == 0:
             super().wheelEvent(event)
             return
-        self._video_zoom = max(-2.0, min(4.0, self._video_zoom + delta / 1200.0))
-        self._apply_video_view()
-        event.accept()
+        if self.adjust_zoom_by_wheel_delta(delta):
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:

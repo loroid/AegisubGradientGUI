@@ -233,6 +233,10 @@ class FrameSampler:
         """Return a copy of the currently loaded RGB frame image."""
         return self._image.copy() if self._image else None
 
+    def image_size(self):
+        """Return the currently loaded frame size as (width, height)."""
+        return self._image.size if self._image else None
+
     def frame_cache_key(self):
         """Return a stable key for the currently cached frame."""
         if not self._image or not self._current_video:
