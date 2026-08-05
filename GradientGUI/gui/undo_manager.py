@@ -22,6 +22,7 @@ class UndoState:
     curve_mirrors: dict[str, tuple[bool, bool]] = field(default_factory=dict)
     sampling_paths: dict[str, dict[str, Any]] = field(default_factory=dict)
     selected_lines: list[int] = field(default_factory=list)
+    reference_lines: list[int] = field(default_factory=list)
     active_event_idx: int = 0
     active_curve_key: str = ""
     mode: str = "Horizontal"         # GradientMode name

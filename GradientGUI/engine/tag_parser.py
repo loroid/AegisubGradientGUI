@@ -48,8 +48,8 @@ TAG_INFO = {
     # Scale / Shearing
     "fscx":  {"type": "numeric", "label": "\\fscx  X缩放",  "group": "Transform", "default": 100},
     "fscy":  {"type": "numeric", "label": "\\fscy  Y缩放",  "group": "Transform", "default": 100},
-    "fax":   {"type": "numeric", "label": "\\fax  X错切",   "group": "Transform", "default": 0},
-    "fay":   {"type": "numeric", "label": "\\fay  Y错切",   "group": "Transform", "default": 0},
+    "fax":   {"type": "numeric", "label": "\\fax  X错切",   "group": "Transform", "default": 0, "precision": 6, "input_step": 0.001},
+    "fay":   {"type": "numeric", "label": "\\fay  Y错切",   "group": "Transform", "default": 0, "precision": 6, "input_step": 0.001},
     # Rotation
     "frx":   {"type": "numeric", "label": "\\frx  X旋转",   "group": "Transform", "default": 0},
     "fry":   {"type": "numeric", "label": "\\fry  Y旋转",   "group": "Transform", "default": 0},
@@ -334,9 +334,11 @@ def build_tag_string(tag: str, value) -> str:
 
     else:  # numeric
         def _fmt_numeric(v) -> str:
-            if isinstance(v, float) and v == int(v):
-                return str(int(v))
-            return f"{float(v):.2f}"
+            numeric = float(v)
+            if numeric == int(numeric):
+                return str(int(numeric))
+            precision = max(0, min(10, int(info.get("precision", 2))))
+            return f"{numeric:.{precision}f}"
 
         if tag in {"bord", "xbord", "ybord", "blur", "be"}:
             value = max(0.0, float(value))

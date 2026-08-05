@@ -216,7 +216,15 @@ class NodeItem(QGraphicsEllipseItem):
                     )
                     val = float(val)
                 else:
-                    val, ok = QInputDialog.getDouble(None, tr("设置数值"), tr("输入此节点的数值:"), self.curve_node.y, -9999, 9999, decimals=2)
+                    val, ok = QInputDialog.getDouble(
+                        None,
+                        tr("设置数值"),
+                        tr("输入此节点的数值:"),
+                        self.curve_node.y,
+                        -9999,
+                        9999,
+                        decimals=self.editor._value_decimals,
+                    )
                 if ok:
                     self.curve_node.y = val
                     self.editor.recalculate_bounds()
@@ -361,6 +369,7 @@ class CurveEditorView(QGraphicsView):
         self._is_text = False
         self._integer_x = False
         self._integer_y = False
+        self._value_decimals = 2
         self._fixed_y_range: Optional[tuple[float, float]] = None
         self._y_min = 0.0
         self._y_max = 1.0
@@ -440,6 +449,9 @@ class CurveEditorView(QGraphicsView):
                 node.handle_out_y = float(round(node.handle_out_y))
         self.recalculate_bounds()
         self._redraw_all()
+
+    def set_value_precision(self, decimals: int):
+        self._value_decimals = max(0, min(10, int(decimals)))
 
     def set_integer_x(self, enabled: bool):
         self._integer_x = bool(enabled)
@@ -864,11 +876,18 @@ class BatchNodesDialog(QDialog):
         integer_x: bool = False,
         integer_y: bool = False,
         parent=None,
+        value_decimals: int = 2,
+        value_single_step: float = 0.1,
     ):
         super().__init__(parent)
         is_value_string = is_color or is_text
         self._integer_x = bool(integer_x)
         self._integer_y = bool(integer_y)
+        self._value_decimals = max(0, min(10, int(value_decimals)))
+        self._value_single_step = max(
+            float(value_single_step),
+            10 ** (-self._value_decimals),
+        )
         self._x_max = max(1.0, float(x_max or 100.0))
         self.setWindowTitle(tr("批量增加控制点"))
         layout = QVBoxLayout(self)
@@ -900,16 +919,16 @@ class BatchNodesDialog(QDialog):
 
         self.value_spin = QDoubleSpinBox()
         self.value_spin.setRange(-9999.0, 9999.0)
-        self.value_spin.setDecimals(0 if self._integer_y else 2)
-        self.value_spin.setSingleStep(1.0 if self._integer_y else 0.1)
+        self.value_spin.setDecimals(0 if self._integer_y else self._value_decimals)
+        self.value_spin.setSingleStep(1.0 if self._integer_y else self._value_single_step)
         self.value_spin.setValue(0.0)
         self.value_spin.setEnabled(not is_value_string)
         form.addRow(tr("数值:"), self.value_spin)
 
         self.value_step_spin = QDoubleSpinBox()
         self.value_step_spin.setRange(0.0, 9999.0)
-        self.value_step_spin.setDecimals(0 if self._integer_y else 2)
-        self.value_step_spin.setSingleStep(1.0 if self._integer_y else 0.1)
+        self.value_step_spin.setDecimals(0 if self._integer_y else self._value_decimals)
+        self.value_step_spin.setSingleStep(1.0 if self._integer_y else self._value_single_step)
         self.value_step_spin.setValue(1.0)
         self.value_step_spin.setEnabled(not is_value_string)
         form.addRow(tr("数值变化量:"), self.value_step_spin)
@@ -970,6 +989,8 @@ class CurveEditorWidget(QWidget):
         self._title_text = title
         self._integer_x = bool(integer_x)
         self._integer_y = bool(integer_y)
+        self._value_decimals = 2
+        self._value_single_step = 0.1
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -1064,6 +1085,14 @@ class CurveEditorWidget(QWidget):
         self._integer_y = bool(enabled)
         self._view.set_integer_y(enabled)
 
+    def set_value_precision(self, decimals: int, single_step: float = 0.1):
+        self._value_decimals = max(0, min(10, int(decimals)))
+        self._value_single_step = max(
+            float(single_step),
+            10 ** (-self._value_decimals),
+        )
+        self._view.set_value_precision(self._value_decimals)
+
     def set_integer_x(self, enabled: bool):
         self._integer_x = bool(enabled)
         self._view.set_integer_x(enabled)
@@ -1133,6 +1162,8 @@ class CurveEditorWidget(QWidget):
             self._integer_x,
             self._integer_y,
             self,
+            value_decimals=self._value_decimals,
+            value_single_step=self._value_single_step,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

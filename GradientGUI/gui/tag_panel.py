@@ -240,6 +240,8 @@ class ScreenColorPicker(QWidget):
 class ValueInput(QWidget):
     """A widget for inputting a single value based on tag type."""
     changed = Signal()
+    preview_color_changed = Signal(str)
+    preview_color_cancelled = Signal()
 
     def __init__(self, tag_type: str, tag: str = "", parent=None):
         super().__init__(parent)
@@ -288,10 +290,13 @@ class ValueInput(QWidget):
             self._text.textChanged.connect(lambda: self.changed.emit())
             layout.addWidget(self._text)
         else:
+            tag_info = TAG_INFO.get(self.tag, {})
             self._spin = QDoubleSpinBox()
             self._spin.setRange(-9999, 9999)
-            self._spin.setDecimals(2)
-            wide_numeric_tags = {"fscx", "fscy", "fs"}
+            self._spin.setDecimals(int(tag_info.get("precision", 2)))
+            if "input_step" in tag_info:
+                self._spin.setSingleStep(float(tag_info["input_step"]))
+            wide_numeric_tags = {"fscx", "fscy", "fs", "fax", "fay"}
             self._spin.setFixedWidth(88 if self.tag in wide_numeric_tags else 72)
             self._spin.valueChanged.connect(lambda: self.changed.emit())
             layout.addWidget(self._spin)
@@ -363,8 +368,11 @@ class ValueInput(QWidget):
             color = dialog.selectedColor()
             if color.isValid():
                 self._set_color(color)
+            else:
+                self.preview_color_cancelled.emit()
         else:
             self._update_btn()
+            self.preview_color_cancelled.emit()
 
     def _pick_screen(self):
         picker = ScreenColorPicker(self.window())
@@ -390,6 +398,7 @@ class ValueInput(QWidget):
     def _preview_color(self, color: QColor):
         if color.isValid():
             self._apply_btn_color(color)
+            self.preview_color_changed.emit(_qcolor_to_bgr(color))
 
     def _apply_btn_color(self, color: QColor):
         self._btn.setIcon(_make_color_icon(_qcolor_to_bgr(color)))
@@ -416,6 +425,8 @@ class TagRowWidget(QFrame):
     changed = Signal(str)
     selected = Signal(str)
     path_requested = Signal(str)
+    preview_color_changed = Signal(str, int, str)
+    preview_color_cancelled = Signal(str, int)
 
     def __init__(self, tag: str, parent=None):
         super().__init__(parent)
@@ -589,8 +600,19 @@ class TagRowWidget(QFrame):
             self.changed.emit(self.tag)
             
     def _add_input_widget(self):
+        input_index = len(self._inputs)
         inp = ValueInput(self.tag_type, self.tag)
         inp.changed.connect(self._on_val_changed)
+        inp.preview_color_changed.connect(
+            lambda value, index=input_index: self.preview_color_changed.emit(
+                self.tag, index, value
+            )
+        )
+        inp.preview_color_cancelled.connect(
+            lambda index=input_index: self.preview_color_cancelled.emit(
+                self.tag, index
+            )
+        )
         if self._inputs:
             lbl = QLabel("→")
             self._values_layout.addWidget(lbl)
@@ -705,6 +727,8 @@ class TagPanel(QWidget):
     tag_changed = Signal(str)
     tag_selected = Signal(str)
     path_sample_requested = Signal(str)
+    preview_color_changed = Signal(str, int, str)
+    preview_color_cancelled = Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -756,6 +780,8 @@ class TagPanel(QWidget):
                 row.changed.connect(self.tag_changed.emit)
                 row.selected.connect(self._on_row_selected)
                 row.path_requested.connect(self.path_sample_requested.emit)
+                row.preview_color_changed.connect(self.preview_color_changed.emit)
+                row.preview_color_cancelled.connect(self.preview_color_cancelled.emit)
                 self._tag_layout.addWidget(row)
                 self._rows[tag] = row
 

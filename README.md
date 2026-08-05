@@ -88,12 +88,13 @@ autoload/
 - Visual curve editor for ASS override tags.
 - Bilingual Chinese/English UI. Chinese system locales open in Chinese by default; other locales open in English, and the compact top-right language button can switch at runtime. Translated buttons auto-fit their current label so English text is not clipped.
 - Real-time preview with embedded mpv video playback.
+- Throttled live preview while choosing manual colors; canceling a color dialog restores the previous committed value.
 - libass pixel bounds for rendered subtitle visibility, instead of font metrics boxes.
 - Strip gradients: Horizontal, Vertical, and arbitrary Angled modes.
 - Layout-positioned subtitle lines without `\pos` are converted to an equivalent static `\pos` during strip generation, so generated overlay strips stay stacked at the original on-screen position.
 - Existing vector `\clip` and `\iclip` masks are split per generated strip instead of being reduced to rectangle clips.
 - GBC mode: gradient by character.
-- Multi-line editing and optional merged range calculation.
+- Multi-line editing and optional merged range calculation. Any line passed into GradientGUI can be marked as a per-line visual reference: it remains visible unchanged in the preview but is excluded from gradient generation, merged ranges, and processing.
 - Path color sampling from the current video frame using ASS drawing paths.
 - Per-color-tag path sampling controls for `\1c`, `\2c`, `\3c`, and `\4c`, including mirror and adjustable smooth strength.
 - Cyclic gradient animation for selected tags, with `\t` transform output by default where ASS supports it, per-tag frame-step timing, per-tag movement curves, per-tag optional head/tail seam blending, a tag overview, and a timeline overview.
@@ -123,6 +124,8 @@ autoload/
 | Position | `\pos`, `\org` |
 | Style | `\fn` |
 
+Dimensionless shear tags `\fax` and `\fay` retain six decimal places in the editor and generated ASS, avoiding visible 0.01-value stepping across large subtitle geometry. Other numeric tags keep their existing two-decimal output precision.
+
 ## Gradient Modes
 
 | Mode | Description |
@@ -144,7 +147,7 @@ Important details:
 - Repeated coordinates along the active gradient axis are deduplicated.
 - Saved path samples are direction-independent. Horizontal, Vertical, and Angled modes reproject the stored coordinates so mode changes update immediately without reading the video frame again.
 - When Aegisub frame metadata is available, interactive path sampling loads the current frame by its exported frame time for responsiveness while keeping cache identity tied to the whole-video frame number.
-- With smooth sampling disabled, generated clip strips are divided by the number of sampled integer pixels, so each sampled color can be represented directly.
+- With smooth sampling disabled, generated clip strips are divided by the number of sampled integer pixels, so each sampled color can be represented directly; the global Step value does not apply in this mode.
 - When merged range is enabled for a color tag, path-sampled colors are mapped against the merged projected range instead of each line's local range.
 - Smooth sampling blends each generated strip color toward the interpolation between adjacent sampled colors. This can create intermediate colors that were not exact sampled source pixels; disable smooth sampling when the output must use only captured pixel colors.
 - The curve editor previews the same sampled, mirrored, and smooth-strength-adjusted colors in its lower color strip.

@@ -1307,6 +1307,22 @@ def _copy_event_with_ms(evt: ASSEvent, start_ms: int, end_ms: int) -> ASSEvent:
     return _copy_event_with_time(evt, start_ms / 1000.0, end_ms / 1000.0)
 
 
+def compose_preview_events(
+    source_events: list[ASSEvent],
+    reference_indices: list[int],
+    generated_events: list[ASSEvent],
+) -> list[ASSEvent]:
+    """Add designated input lines to preview without processing them."""
+
+    reference_set = {
+        idx for idx in reference_indices if 0 <= idx < len(source_events)
+    }
+    references = [
+        event for idx, event in enumerate(source_events) if idx in reference_set
+    ]
+    return references + list(generated_events)
+
+
 def build_preview_ass(ass_file: ASSFile, events: list[ASSEvent]) -> str:
     """Build a minimal ASS document for preview rendering."""
 

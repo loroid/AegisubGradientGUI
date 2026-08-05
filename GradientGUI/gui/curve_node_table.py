@@ -365,4 +365,4 @@ def _cell_text(table: QTableWidget, row: int, col: int) -> str:
 def _fmt_float(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
-    return f"{float(value):.4f}".rstrip("0").rstrip(".")
+    return f"{float(value):.6f}".rstrip("0").rstrip(".")

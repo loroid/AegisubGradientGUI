@@ -203,6 +203,7 @@ EN = {
     "模式:": "Mode:",
     "角度 (°):": "Angle (°):",
     "步长 (px):": "Step (px):",
+    "路径采色关闭平滑时，按采样颜色数量切分，步长不生效。": "With path smoothing off, strips follow the sampled-color count; Step does not apply.",
     "保存预设": "Save Preset",
     "加载预设": "Load Preset",
     "最近预设": "Recent",
@@ -306,6 +307,8 @@ EN = {
     "仅当前": "Current",
     "将多选行视为一个整体，共用合并后的渐变范围": "Treat selected lines as one group and use a merged gradient range",
     "设置哪些 tag 使用整体范围": "Choose which tags use merged range",
+    "参照": "Reference",
+    "在传入行右端开启参照后，该行只在预览中原样显示，不参与渐变处理": "Enable Reference at the right of an input line to show it unchanged in the preview without processing it",
     # Tag panel
     "颜色空间:": "Color Space:",
     "打开颜色选择器": "Open color picker",

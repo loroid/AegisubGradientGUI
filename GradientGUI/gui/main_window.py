@@ -82,6 +82,7 @@ from gui.gradient_generation import (
     GradientGenerationError,
     TRANSFORMABLE_ANIMATION_TAGS,
     build_preview_ass,
+    compose_preview_events,
     generate_gradient_events,
 )
 from gui.preview_cache import PreviewGenerationCache, stable_preview_key
@@ -209,6 +210,44 @@ QListWidget::item:selected { background: #4a4a8a; }
 """
 
 
+class HintStatusBar(QStatusBar):
+    """Append a persistent hint directly after transient status text."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hint_provider = None
+        self._base_message = ""
+
+    def set_hint_provider(self, provider) -> None:
+        self._hint_provider = provider
+        self.refresh_hint()
+
+    def refresh_hint(self) -> None:
+        if self._base_message:
+            super().showMessage(self._compose(self._base_message))
+
+    def showMessage(self, message: str, timeout: int = 0) -> None:
+        self._base_message = str(message or "")
+        super().showMessage(self._compose(self._base_message), timeout)
+
+    def clearMessage(self) -> None:
+        self._base_message = ""
+        super().clearMessage()
+
+    def _compose(self, message: str) -> str:
+        hint = ""
+        if self._hint_provider is not None:
+            try:
+                hint = str(self._hint_provider() or "").strip()
+            except Exception:
+                hint = ""
+        if not hint:
+            return message
+        if not message:
+            return hint
+        return f"{message} | {hint}"
+
+
 class MainWindow(QMainWindow):
     """Main GradientGUI window."""
 
@@ -247,6 +286,7 @@ class MainWindow(QMainWindow):
         self._loop_preview_native = False
         self._current_color_preview_stops: list[tuple[float, str]] = []
         self._current_color_sample_colors: list[tuple[int, str]] = []
+        self._manual_color_preview: dict[tuple[str, int], str] = {}
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(80)
@@ -327,6 +367,7 @@ class MainWindow(QMainWindow):
         self._line_panel.active_line_changed.connect(self._on_active_line_changed)
         self._line_panel.selection_changed.connect(self._on_line_selection_changed)
         self._line_panel.merge_changed.connect(self._schedule_preview)
+        self._line_panel.reference_lines_changed.connect(self._on_reference_lines_changed)
         self._line_panel.settings_requested.connect(self._open_group_range_settings)
         left_layout.addWidget(self._line_panel, stretch=0)
 
@@ -343,6 +384,8 @@ class MainWindow(QMainWindow):
         self._tag_panel.tag_changed.connect(self._on_tag_changed)
         self._tag_panel.tag_selected.connect(self._on_tag_selected)
         self._tag_panel.path_sample_requested.connect(self._on_path_sample_requested)
+        self._tag_panel.preview_color_changed.connect(self._on_color_preview_changed)
+        self._tag_panel.preview_color_cancelled.connect(self._on_color_preview_cancelled)
         top_splitter.addWidget(self._tag_panel)
 
         top_splitter.setChildrenCollapsible(False)
@@ -534,8 +577,9 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(controls)
         startup_profile.mark("build_ui.bottom_controls")
 
-        self._status = QStatusBar()
+        self._status = HintStatusBar()
         self.setStatusBar(self._status)
+        self._status.set_hint_provider(self._step_status_hint)
         self._status.showMessage(tr("就绪"))
         self._refresh_recent_presets_menu()
         startup_profile.mark("build_ui.status_and_recent")
@@ -543,6 +587,46 @@ class MainWindow(QMainWindow):
     def _toggle_language(self) -> None:
         toggle_language()
         self._retranslate_ui()
+
+    def _step_status_hint(self) -> str:
+        color_tags = {"1c", "2c", "3c", "4c"}
+        if not self._source_events:
+            return ""
+
+        configs = self._tag_panel.get_all_configs()
+        smooth_map = self._tag_panel.get_path_smooth_map()
+        eligible_tags = {
+            tag
+            for tag in color_tags
+            if bool(getattr(configs.get(tag), "enabled", False))
+            and not bool(smooth_map.get(tag, False))
+        }
+        if not eligible_tags:
+            return ""
+
+        selected_indices = self._line_panel.selected_indices(
+            self._active_event_idx,
+            fallback=True,
+        )
+        for idx in selected_indices:
+            if not (0 <= idx < len(self._source_events)):
+                continue
+            try:
+                _, paths = extract_clip_tags(self._source_events[idx].text)
+            except Exception:
+                paths = {}
+            for tag, path in sampling_paths_for_event(
+                self._sampling_paths,
+                self._active_event_idx,
+                idx,
+            ).items():
+                if path:
+                    paths[tag] = path
+                else:
+                    paths.pop(tag, None)
+            if any(paths.get(tag) for tag in eligible_tags):
+                return tr("路径采色关闭平滑时，按采样颜色数量切分，步长不生效。")
+        return ""
 
     def _start_update_check(self) -> None:
         if self._update_check_thread is not None:
@@ -581,6 +665,7 @@ class MainWindow(QMainWindow):
         self._mode_label.setText(tr("模式:"))
         self._angle_label.setText(tr("角度 (°):"))
         self._step_label.setText(tr("步长 (px):"))
+        self._status.refresh_hint()
         self._retranslate_command_buttons()
         self._video.retranslate_ui()
         self._line_panel.retranslate_ui()
@@ -730,8 +815,20 @@ class MainWindow(QMainWindow):
         self._schedule_preview()
 
     def _on_line_selection_changed(self):
-        if not self._selected_event_indices(fallback=False):
+        if not self._line_panel.has_selection():
             self._line_panel.select_current(self._active_event_idx, emit=False)
+        self._schedule_preview()
+
+    def _on_color_preview_changed(self, tag: str, input_index: int, color: str):
+        self._manual_color_preview[(tag, int(input_index))] = str(color).upper()
+        self._schedule_preview_only()
+
+    def _on_color_preview_cancelled(self, tag: str, input_index: int):
+        self._manual_color_preview.pop((tag, int(input_index)), None)
+        self._schedule_preview_only()
+
+    def _on_reference_lines_changed(self):
+        self._push_undo(tr("参照"))
         self._schedule_preview()
 
     def _open_group_range_settings(self):
@@ -823,6 +920,14 @@ class MainWindow(QMainWindow):
         self._tag_modes[key] = cfg.mode
 
     def _on_tag_changed(self, tag: str):
+        if tag:
+            self._manual_color_preview = {
+                key: value
+                for key, value in self._manual_color_preview.items()
+                if key[0] != tag
+            }
+        else:
+            self._manual_color_preview.clear()
         self._sync_tabs()
         row = self._tag_panel.get_row(tag)
         if row and not getattr(row, '_syncing', False):
@@ -885,9 +990,14 @@ class MainWindow(QMainWindow):
         for t, row_widget in self._tag_panel._rows.items():
             row_widget.set_active(t == tag)
 
-        tag_type = TAG_INFO.get(tag, {}).get("type")
+        tag_info = TAG_INFO.get(tag, {})
+        tag_type = tag_info.get("type")
         is_color = tag_type == "color"
         is_text = tag_type == "text"
+        self._curve_editor.set_value_precision(
+            int(tag_info.get("precision", 2)),
+            float(tag_info.get("input_step", 0.1)),
+        )
 
         # Load this tag's curve
         self._syncing_curve_editor = True
@@ -2250,6 +2360,10 @@ class MainWindow(QMainWindow):
         self._preview_timer.start()
         self._queue_undo("编辑")
 
+    def _schedule_preview_only(self):
+        """Refresh visual preview without committing a temporary color edit."""
+        self._preview_timer.start()
+
     def _queue_undo(self, description: str = "编辑"):
         if self._undo_suspended:
             return
@@ -2300,6 +2414,15 @@ class MainWindow(QMainWindow):
             bounds=self._bounds,
             animation_settings=self._animation_settings(),
         )
+        if self._manual_color_preview:
+            for (tag, input_index), color in self._manual_color_preview.items():
+                config = settings.tags.get(tag)
+                if not config or not config.nodes:
+                    continue
+                config = copy.deepcopy(config)
+                node_index = 0 if int(input_index) <= 0 else -1
+                config.nodes[node_index].value_str = color
+                settings.tags[tag] = config
         video_frame = self._current_preview_video_frame()
         if settings.video_path and video_frame >= 0:
             settings.video_frame = video_frame
@@ -2352,6 +2475,10 @@ class MainWindow(QMainWindow):
                 "selected_indices": selected_indices,
                 "source_events": source_events,
                 "group_range_bounds": group_range_bounds,
+                "manual_color_preview": sorted(
+                    (tag, int(index), color)
+                    for (tag, index), color in self._manual_color_preview.items()
+                ),
                 "state": state_data,
             }
         )
@@ -2407,7 +2534,11 @@ class MainWindow(QMainWindow):
             group_range_bounds,
             base_settings,
         )
-        preview_events = list(result_events)
+        preview_events = compose_preview_events(
+            self._source_events,
+            self._line_panel.reference_indices(),
+            result_events,
+        )
         if self._last_preview_debug_data:
             base_debug_event = (
                 self._source_events[selected_indices[0]]
@@ -2882,7 +3013,8 @@ class MainWindow(QMainWindow):
             animation_modes=state_codec.serialize_curve_modes(self._animation_modes),
             animation_curve_mirrors=copy.deepcopy(self._animation_curve_mirrors),
             sampling_paths=serialize_path_state(self._sampling_paths),
-            selected_lines=self._selected_event_indices(fallback=False),
+            selected_lines=self._line_panel.raw_selected_indices(),
+            reference_lines=self._line_panel.reference_indices(),
             active_event_idx=self._active_event_idx,
             active_curve_key=self._active_curve_key or "",
             description=description,
@@ -2940,7 +3072,8 @@ class MainWindow(QMainWindow):
             return
 
         # A preset describes the effect. Keep the user's current line selection.
-        state.selected_lines = self._selected_event_indices(fallback=False)
+        state.selected_lines = self._line_panel.raw_selected_indices()
+        state.reference_lines = self._line_panel.reference_indices()
         state.active_event_idx = self._active_event_idx
         if not state.active_curve_key:
             state.active_curve_key = self._active_curve_key or ""
@@ -2965,7 +3098,8 @@ class MainWindow(QMainWindow):
             self._refresh_recent_presets_menu()
             return
 
-        state.selected_lines = self._selected_event_indices(fallback=False)
+        state.selected_lines = self._line_panel.raw_selected_indices()
+        state.reference_lines = self._line_panel.reference_indices()
         state.active_event_idx = self._active_event_idx
         if not state.active_curve_key:
             state.active_curve_key = self._active_curve_key or ""
@@ -3206,6 +3340,7 @@ class MainWindow(QMainWindow):
             "tag_sync_debug": tag_sync_debug,
             "active_tag_sync_debug": tag_sync_debug.get(self._active_tag) if self._active_tag else None,
             "selected_indices": selected,
+            "reference_indices": self._line_panel.reference_indices(),
             "active_event_idx": self._active_event_idx,
             "source_events": source_events,
             "preview_result_sample": [
@@ -3335,6 +3470,10 @@ class MainWindow(QMainWindow):
             getattr(state, "selected_lines", []),
             len(self._source_events),
         )
+        self._line_panel.set_reference_indices(
+            getattr(state, "reference_lines", []),
+            len(self._source_events),
+        )
 
         saved_curve_key = getattr(state, "active_curve_key", "") or self._active_curve_key
         self._active_curve_key = saved_curve_key
@@ -3344,9 +3483,14 @@ class MainWindow(QMainWindow):
         # Reload active curve
         if self._active_curve_key and self._active_curve_key in self._tag_curves:
             tag = curve_key_tag(self._active_curve_key) or self._active_curve_key
-            tag_type = TAG_INFO.get(tag, {}).get("type")
+            tag_info = TAG_INFO.get(tag, {})
+            tag_type = tag_info.get("type")
             is_color = tag_type == "color"
             is_text = tag_type == "text"
+            self._curve_editor.set_value_precision(
+                int(tag_info.get("precision", 2)),
+                float(tag_info.get("input_step", 0.1)),
+            )
             self._curve_editor.set_nodes(
                 self._tag_curves[self._active_curve_key], is_color, is_text
             )
