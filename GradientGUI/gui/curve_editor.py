@@ -6,6 +6,7 @@ v3.1: Single curve per tag with independent Y-axis scaling.
 """
 
 from __future__ import annotations
+import copy
 import math
 from typing import Optional
 
@@ -16,13 +17,14 @@ from PySide6.QtWidgets import (
     QMenu, QPushButton, QSizePolicy, QApplication, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QFormLayout, QSpinBox,
 )
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QLineF
+from PySide6.QtCore import Qt, QEvent, QRectF, QPointF, Signal, QLineF
 from PySide6.QtGui import (
     QPen, QBrush, QColor, QPainterPath, QPainter, QFont, QAction,
+    QImage, QPixmap, QTransform,
 )
 
 from engine.interpolation import (
-    CurveNode, InterpolationMode, interpolate, make_default_nodes,
+    ColorSpace, CurveNode, InterpolationMode, interpolate, make_default_nodes, mirror_nodes_horizontal,
 )
 from gui.curve_node_table import CurveNodeTableDialog
 from gui.i18n import fit_button_width, set_button_text, tr
@@ -34,6 +36,8 @@ MARGIN_TOP = 20
 MARGIN_BOTTOM = 40
 NODE_RADIUS = 7
 HANDLE_RADIUS = 5
+MIN_Y_VIEW_SPAN = 1e-6
+MAX_Y_VIEW_SPAN = 1e12
 
 COLOR_BG = QColor(24, 24, 42)
 COLOR_GRID = QColor(50, 50, 80)
@@ -51,6 +55,23 @@ INTERP_MODE_NAMES = {
     InterpolationMode.BEZIER: "Bezier",
 }
 
+
+def _locked_drag_delta(delta: QPointF, modifiers) -> QPointF:
+    x, y = delta.x(), delta.y()
+    ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+    shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+    if ctrl and shift:
+        if abs(x) >= abs(y):
+            y = 0.0
+        else:
+            x = 0.0
+    elif ctrl:
+        y = 0.0
+    elif shift:
+        x = 0.0
+    return QPointF(x, y)
+
+
 # ── Draggable Node Item ──────────────────────────────────────────────────────
 class NodeItem(QGraphicsEllipseItem):
     def __init__(
@@ -64,6 +85,7 @@ class NodeItem(QGraphicsEllipseItem):
         super().__init__(-NODE_RADIUS, -NODE_RADIUS, NODE_RADIUS * 2, NODE_RADIUS * 2)
         self.curve_node = curve_node
         self.editor = editor
+        self._syncing_position = False
         self._is_start_endpoint = bool(is_start_endpoint)
         self._is_end_endpoint = bool(is_end_endpoint)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
@@ -76,55 +98,102 @@ class NodeItem(QGraphicsEllipseItem):
         self.handle_in: Optional[HandleItem] = None
         self.handle_out: Optional[HandleItem] = None
         self._dragging = False
-        self._drag_origin = QPointF()
+        self._mouse_origin = QPointF()
+        self._drag_nodes = []
+        self._last_drag_delta = (0.0, 0.0)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._drag_origin = self.pos()
-        super().mousePressEvent(event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        if not self.isSelected():
+            if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.editor.scene().clearSelection()
+            self.setSelected(True)
+        self._drag_nodes = [
+            (item, copy.copy(item.curve_node))
+            for item in self.editor._node_items if item.isSelected()
+        ]
+        self._dragging = True
+        self._mouse_origin = event.scenePos()
+        self._last_drag_delta = (0.0, 0.0)
+        rect = self.editor.plot_rect()
+        self._drag_scale = (
+            self.editor.x_max() / rect.width(),
+            (self.editor._y_max - self.editor._y_min) / rect.height(),
+        )
+        self.editor._begin_drag()
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if not self._dragging:
+            super().mouseMoveEvent(event)
+            return
+        delta = _locked_drag_delta(event.scenePos() - self._mouse_origin, event.modifiers())
+        dx, dy = delta.x() * self._drag_scale[0], -delta.y() * self._drag_scale[1]
+        if self.editor._integer_x:
+            dx = float(round(dx))
+        if self.editor._integer_y:
+            dy = float(round(dy))
+        if self.editor._is_color or self.editor._is_text:
+            dy = 0.0
+        x_lo = max(-node.x for _, node in self._drag_nodes)
+        x_hi = min(self.editor.x_max() - node.x for _, node in self._drag_nodes)
+        dx = max(x_lo, min(x_hi, dx))
+        if any(item._is_start_endpoint or item._is_end_endpoint for item, _ in self._drag_nodes):
+            dx = 0.0
+        if not (self.editor._is_color or self.editor._is_text):
+            y_lo = max(self.editor._y_min - node.y for _, node in self._drag_nodes)
+            y_hi = min(self.editor._y_max - node.y for _, node in self._drag_nodes)
+            dy = max(y_lo, min(y_hi, dy))
+        if (dx, dy) != self._last_drag_delta:
+            # Update all model coordinates before publishing a preview/undo change.
+            for item, origin in self._drag_nodes:
+                node = item.curve_node
+                node.x, node.y = origin.x + dx, origin.y + dy
+                node.handle_in_x, node.handle_in_y = origin.handle_in_x + dx, origin.handle_in_y + dy
+                node.handle_out_x, node.handle_out_y = origin.handle_out_x + dx, origin.handle_out_y + dy
+            for item, _ in self._drag_nodes:
+                item.update_position()
+                if item.handle_in:
+                    item.handle_in.update_position()
+                if item.handle_out:
+                    item.handle_out.update_position()
+            self._last_drag_delta = (dx, dy)
+            self.editor._nodes.sort(key=lambda node: node.x)
+            self.editor.update_curve()
+        event.accept()
 
     def mouseReleaseEvent(self, event):
-        self._dragging = False
-        super().mouseReleaseEvent(event)
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._snap_x_after_drag()
-
-    def _snap_x_after_drag(self):
-        if not self.editor._integer_x:
-            return
-        rect = self.editor.plot_rect()
-        if self._is_start_endpoint:
-            value_x = 0.0
-        elif self._is_end_endpoint:
-            value_x = self.editor.x_max()
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
+            self._dragging = False
+            self._drag_nodes = []
+            event.accept()
+            self.editor._end_drag()
         else:
-            value_x = self.editor._snap_x_value(self.curve_node.x)
-        self.curve_node.x = value_x
-        x = max(rect.left(), min(rect.right(), self.editor.value_x_to_scene(value_x)))
-        self.setPos(QPointF(x, self.pos().y()))
-        if self.handle_in:
-            self.handle_in.update_position()
-        if self.handle_out:
-            self.handle_out.update_position()
-        self.editor.update_curve()
+            super().mouseReleaseEvent(event)
 
-    def _apply_axis_lock(self, x: float, y: float) -> tuple[float, float]:
-        if not self._dragging:
-            return x, y
-        modifiers = QApplication.keyboardModifiers()
-        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
-        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
-        if ctrl and shift:
-            if abs(x - self._drag_origin.x()) >= abs(y - self._drag_origin.y()):
-                y = self._drag_origin.y()
-            else:
-                x = self._drag_origin.x()
-        elif ctrl:
-            y = self._drag_origin.y()
-        elif shift:
-            x = self._drag_origin.x()
-        return x, y
+    def sceneEvent(self, event):
+        if event.type() == QEvent.Type.UngrabMouse and self._dragging:
+            self._dragging = False
+            self._drag_nodes = []
+            self.editor._end_drag()
+        return super().sceneEvent(event)
+
+    def _endpoint_x(self) -> float:
+        if not self.editor._pin_endpoints_to_range:
+            return self.curve_node.x
+        return 0.0 if self._is_start_endpoint else self.editor.x_max()
+
+    def update_position(self):
+        self._syncing_position = True
+        try:
+            self.setPos(
+                self.editor.value_x_to_scene(self.curve_node.x),
+                self.editor.value_y_to_scene(self.curve_node.y),
+            )
+        finally:
+            self._syncing_position = False
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
@@ -133,16 +202,18 @@ class NodeItem(QGraphicsEllipseItem):
             else:
                 self.setPen(QPen(QColor(255, 255, 255, 200), 1.5))
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            if self._syncing_position:
+                return super().itemChange(change, value)
             new_pos = value
             rect = self.editor.plot_rect()
-            x, y = self._apply_axis_lock(new_pos.x(), new_pos.y())
+            x, y = new_pos.x(), new_pos.y()
             x = max(rect.left(), min(rect.right(), x))
             y = max(rect.top(), min(rect.bottom(), y))
             if self.editor._is_color or self.editor._is_text:
                 y = self.editor.value_y_to_scene(0.0)
             if self._is_start_endpoint or self._is_end_endpoint:
-                x = rect.left() if self._is_start_endpoint else rect.right()
-            value_x = self.editor.scene_x_to_value(x, snap=not self._dragging)
+                x = self.editor.value_x_to_scene(self._endpoint_x())
+            value_x = self.editor.scene_x_to_value(x)
             x = self.editor.value_x_to_scene(value_x)
             new_pos = QPointF(x, y)
             self.curve_node.x = value_x
@@ -229,7 +300,6 @@ class NodeItem(QGraphicsEllipseItem):
                     self.curve_node.y = val
                     self.editor.recalculate_bounds()
                     self.editor._redraw_all()
-                    self.editor.curve_changed.emit()
         elif action and action == set_color_action:
             from PySide6.QtWidgets import QColorDialog
             c_str = self.curve_node.value_str.ljust(6, '0') if self.curve_node.value_str else "FFFFFF"
@@ -256,6 +326,7 @@ class HandleItem(QGraphicsEllipseItem):
         self.node_item = node_item
         self.is_in = is_in
         self.editor = editor
+        self._syncing_position = False
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self.setZValue(9)
@@ -266,34 +337,63 @@ class HandleItem(QGraphicsEllipseItem):
         self.line.setPen(QPen(COLOR_HANDLE_LINE, 1, Qt.PenStyle.DashLine))
         self.line.setZValue(8)
         self._dragging = False
-        self._drag_origin = QPointF()
+        self._mouse_origin = QPointF()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = True
-            self._drag_origin = self.pos()
-        super().mousePressEvent(event)
+            self._mouse_origin = event.scenePos()
+            node = self.node_item.curve_node
+            self._drag_origin_values = (
+                (node.handle_in_x, node.handle_in_y) if self.is_in
+                else (node.handle_out_x, node.handle_out_y)
+            )
+            rect = self.editor.plot_rect()
+            self._drag_scale = (
+                self.editor.x_max() / rect.width(),
+                (self.editor._y_max - self.editor._y_min) / rect.height(),
+            )
+            self.editor._begin_drag()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            delta = _locked_drag_delta(event.scenePos() - self._mouse_origin, event.modifiers())
+            vx, vy = self._drag_origin_values
+            if delta.x():
+                vx = self.editor._snap_x_value(vx + delta.x() * self._drag_scale[0])
+            if delta.y():
+                vy = max(self.editor._y_min, min(self.editor._y_max, vy - delta.y() * self._drag_scale[1]))
+                if self.editor._integer_y:
+                    vy = float(round(vy))
+            node = self.node_item.curve_node
+            previous = (node.handle_in_x, node.handle_in_y) if self.is_in else (node.handle_out_x, node.handle_out_y)
+            if (vx, vy) != previous:
+                if self.is_in:
+                    node.handle_in_x, node.handle_in_y = vx, vy
+                else:
+                    node.handle_out_x, node.handle_out_y = vx, vy
+                self.update_position()
+                self.editor.update_curve()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        self._dragging = False
-        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
+            self._dragging = False
+            event.accept()
+            self.editor._end_drag()
+        else:
+            super().mouseReleaseEvent(event)
 
-    def _apply_axis_lock(self, x: float, y: float) -> tuple[float, float]:
-        if not self._dragging:
-            return x, y
-        modifiers = QApplication.keyboardModifiers()
-        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
-        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
-        if ctrl and shift:
-            if abs(x - self._drag_origin.x()) >= abs(y - self._drag_origin.y()):
-                y = self._drag_origin.y()
-            else:
-                x = self._drag_origin.x()
-        elif ctrl:
-            y = self._drag_origin.y()
-        elif shift:
-            x = self._drag_origin.x()
-        return x, y
+    def sceneEvent(self, event):
+        if event.type() == QEvent.Type.UngrabMouse and self._dragging:
+            self._dragging = False
+            self.editor._end_drag()
+        return super().sceneEvent(event)
 
     def update_position(self):
         cn = self.node_item.curve_node
@@ -303,7 +403,11 @@ class HandleItem(QGraphicsEllipseItem):
         else:
             sx = self.editor.value_x_to_scene(cn.handle_out_x)
             sy = self.editor.value_y_to_scene(cn.handle_out_y)
-        self.setPos(sx, sy)
+        self._syncing_position = True
+        try:
+            self.setPos(sx, sy)
+        finally:
+            self._syncing_position = False
         self._update_line()
 
     def _update_line(self):
@@ -311,14 +415,16 @@ class HandleItem(QGraphicsEllipseItem):
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            if self._syncing_position:
+                return super().itemChange(change, value)
             new_pos = value
             rect = self.editor.plot_rect()
-            x, y = self._apply_axis_lock(new_pos.x(), new_pos.y())
+            x, y = new_pos.x(), new_pos.y()
             x = max(rect.left() - 20, min(rect.right() + 20, x))
             y = max(rect.top() - 20, min(rect.bottom() + 20, y))
             new_pos = QPointF(x, y)
             cn = self.node_item.curve_node
-            vx = self.editor.scene_x_to_value(x, snap=not self._dragging)
+            vx = self.editor.scene_x_to_value(x)
             x = self.editor.value_x_to_scene(vx)
             new_pos = QPointF(x, y)
             vy = self.editor.scene_y_to_value(y)
@@ -332,7 +438,7 @@ class HandleItem(QGraphicsEllipseItem):
             else:
                 cn.handle_out_x = vx
                 cn.handle_out_y = vy
-            self._update_line()
+            self.line.setLine(QLineF(self.node_item.pos(), new_pos))
             self.editor.update_curve()
             return new_pos
         return super().itemChange(change, value)
@@ -341,8 +447,9 @@ class HandleItem(QGraphicsEllipseItem):
 # ── Curve Editor View ─────────────────────────────────────────────────────────
 class CurveEditorView(QGraphicsView):
     curve_changed = Signal()
+    _redraw_after_drag = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, pin_endpoints_to_range: bool = True):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
@@ -350,16 +457,25 @@ class CurveEditorView(QGraphicsView):
         self.setStyleSheet("border: 1px solid #333; background: #18182a;")
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setRubberBandSelectionMode(Qt.ItemSelectionMode.IntersectsItemShape)
 
         self._width = 600
         self._height = 250
         self._x_max = 100.0
+        self._pin_endpoints_to_range = bool(pin_endpoints_to_range)
+        self._active_x_max: Optional[float] = None
+        self._drag_active = False
+        self._redraw_pending = False
+        self._redraw_after_drag.connect(self._flush_drag_redraw, Qt.ConnectionType.QueuedConnection)
         self.setFixedHeight(self._height + MARGIN_TOP + MARGIN_BOTTOM)
 
         self._default_mode = InterpolationMode.LINEAR
+        self._color_space = ColorSpace.RGB
         self._nodes: list[CurveNode] = make_default_nodes()
+        self._notified_curve_state = None
         self._node_items: list[NodeItem] = []
         self._curve_path: Optional[QGraphicsPathItem] = None
         self._color_band_item: Optional[QGraphicsItem] = None
@@ -371,10 +487,12 @@ class CurveEditorView(QGraphicsView):
         self._integer_y = False
         self._value_decimals = 2
         self._fixed_y_range: Optional[tuple[float, float]] = None
+        self._manual_y_range: Optional[tuple[float, float]] = None
         self._y_min = 0.0
         self._y_max = 1.0
         self._screen_color_picker = None
 
+        self._sync_scene_rect()
         self._draw_grid()
         self._rebuild_items()
 
@@ -390,12 +508,24 @@ class CurveEditorView(QGraphicsView):
         except (TypeError, ValueError):
             value = 100.0
         self._x_max = max(1.0, value)
+        self._pin_endpoints()
         self._redraw_all()
 
+    def set_active_x_max(self, x_max: Optional[float]):
+        value = None if x_max is None else max(0.0, float(x_max))
+        if value != self._active_x_max:
+            self._active_x_max = value
+            self._redraw_all()
+
     def recalculate_bounds(self):
+        if self._drag_active:
+            self._redraw_pending = True
+            return
         if self._is_color or self._is_text:
             self._y_min = 0.0
             self._y_max = 1.0
+        elif self._manual_y_range is not None:
+            self._y_min, self._y_max = self._manual_y_range
         elif self._fixed_y_range is not None:
             fixed_min, fixed_max = self._fixed_y_range
             values = [fixed_min, fixed_max]
@@ -412,8 +542,9 @@ class CurveEditorView(QGraphicsView):
             self._y_min = y_min
             self._y_max = y_max
         else:
-            y_min = min((n.y for n in self._nodes), default=0.0)
-            y_max = max((n.y for n in self._nodes), default=1.0)
+            values = [v for n in self._nodes for v in (n.y, n.handle_in_y, n.handle_out_y)]
+            y_min = min(values, default=0.0)
+            y_max = max(values, default=1.0)
             if y_max <= y_min + 1e-5:
                 y_max = y_min + 1.0
             padding = (y_max - y_min) * 0.1
@@ -421,20 +552,60 @@ class CurveEditorView(QGraphicsView):
             self._y_max = y_max + padding
 
     def set_nodes(self, nodes: list[CurveNode]):
+        self._drag_active = False
+        self._redraw_pending = False
+        self._manual_y_range = None
         self._nodes = nodes if nodes else make_default_nodes()
         if self._integer_x:
             for node in self._nodes:
-                self._snap_node_x(node)
+                if self._pin_endpoints_to_range:
+                    self._snap_node_x(node)
+                else:
+                    node.x = float(round(node.x))
+        self._pin_endpoints()
         self.recalculate_bounds()
         self._redraw_all()
 
+    def _pin_endpoints(self):
+        # Apply endpoint constraints on load/range changes, not during painting.
+        self._nodes.sort(key=lambda node: node.x)
+        if self._nodes and self._pin_endpoints_to_range:
+            self._nodes[0].x = 0.0
+            if len(self._nodes) > 1:
+                self._nodes[-1].x = self._x_max
+
     def _redraw_all(self):
+        if self._drag_active:
+            self._redraw_pending = True
+            return
+        selected = {id(item.curve_node) for item in self._node_items if item.isSelected()}
         self._scene.clear()
         self._node_items.clear()
         self._curve_path = None
         self._color_band_item = None
+        self._sync_scene_rect()
         self._draw_grid()
-        self._rebuild_items()
+        self._rebuild_items(selected_nodes=selected)
+
+    def _sync_scene_rect(self):
+        # Hidden/off-range handles must not expand Qt's scrollable canvas.
+        self._scene.setSceneRect(QRectF(
+            0, 0, self._width + MARGIN_LEFT + MARGIN_RIGHT,
+            self._height + MARGIN_TOP + MARGIN_BOTTOM,
+        ))
+
+    def _begin_drag(self):
+        self._drag_active = True
+
+    def _end_drag(self):
+        self._drag_active = False
+        if self._redraw_pending:
+            self._redraw_pending = False
+            self._redraw_after_drag.emit()
+
+    def _flush_drag_redraw(self):
+        self.recalculate_bounds()
+        self._redraw_all()
 
     def set_tag_type(self, is_color: bool, is_text: bool = False):
         self._is_color = is_color
@@ -461,6 +632,7 @@ class CurveEditorView(QGraphicsView):
         self._redraw_all()
 
     def set_y_range(self, y_min: Optional[float], y_max: Optional[float]):
+        previous = self._fixed_y_range
         if y_min is None or y_max is None:
             self._fixed_y_range = None
         else:
@@ -469,6 +641,8 @@ class CurveEditorView(QGraphicsView):
             if hi <= lo + 1e-5:
                 hi = lo + 1.0
             self._fixed_y_range = (lo, hi)
+        if self._fixed_y_range != previous:
+            self._manual_y_range = None
         self.recalculate_bounds()
         self._redraw_all()
 
@@ -491,6 +665,11 @@ class CurveEditorView(QGraphicsView):
         self._color_preview_stops = stops
         self._draw_color_band()
         self.viewport().update()
+
+    def set_color_space(self, color_space: ColorSpace):
+        if self._color_space != color_space:
+            self._color_space = color_space
+            self._draw_color_band()
 
     def pick_color_for_node(self, node: CurveNode):
         from gui.tag_panel import ScreenColorPicker, _qcolor_to_bgr
@@ -546,6 +725,27 @@ class CurveEditorView(QGraphicsView):
         rect = self.plot_rect()
         bg = self._scene.addRect(rect, QPen(Qt.PenStyle.NoPen), QBrush(COLOR_BG))
         bg.setZValue(-2)
+        # Keep off-range curves/handles out of the axis labels when zoomed in.
+        edge = NODE_RADIUS + 2
+        self._plot_layer = self._scene.addRect(
+            rect.adjusted(-edge, -edge, edge, edge),
+            QPen(Qt.PenStyle.NoPen), QBrush(Qt.BrushStyle.NoBrush),
+        )
+        self._plot_layer.setFlag(QGraphicsItem.GraphicsItemFlag.ItemClipsChildrenToShape)
+        self._plot_layer.setZValue(2)
+        if self._active_x_max is not None and self._active_x_max < self._x_max:
+            x = self.value_x_to_scene(self._active_x_max)
+            inactive = self._scene.addRect(
+                QRectF(x, rect.top(), rect.right() - x, rect.height()),
+                QPen(Qt.PenStyle.NoPen), QBrush(QColor(255, 255, 255, 12)),
+            )
+            inactive.setZValue(-1.5)
+            boundary = self._scene.addLine(
+                x, rect.top(), x, rect.bottom(),
+                QPen(COLOR_TEXT, 1, Qt.PenStyle.DashLine),
+            )
+            boundary.setZValue(-0.5)
+            boundary.setToolTip(f"{tr('当前字幕末帧')}: {self._active_x_max:g}")
         font = QFont("Segoe UI", 8)
 
         # X-axis
@@ -573,12 +773,20 @@ class CurveEditorView(QGraphicsView):
                 y = self.value_y_to_scene(vy)
                 self._scene.addLine(rect.left(), y, rect.right(), y, pen).setZValue(-1)
                 if i % 2 == 0:
-                    lbl = self._scene.addText(f"{vy:.1f}", font)
+                    decimals = min(8, max(1, math.ceil(-math.log10(y_range / 5))))
+                    label = f"{vy:.{decimals}f}"
+                    lbl = self._scene.addText(label, font)
+                    for precision in (2, 1):
+                        if lbl.boundingRect().width() <= MARGIN_LEFT - 4:
+                            break
+                        lbl.setPlainText(f"{vy:.{precision}g}")
                     lbl.setDefaultTextColor(COLOR_TEXT)
                     lbl.setPos(2, y - 8)
 
     # ── Node management ──────────────────────────────────────────────────
-    def _rebuild_items(self):
+    def _rebuild_items(self, *, selected_nodes: Optional[set[int]] = None):
+        if selected_nodes is None:
+            selected_nodes = {id(item.curve_node) for item in self._node_items if item.isSelected()}
         for ni in self._node_items:
             if ni.handle_in:
                 self._scene.removeItem(ni.handle_in.line)
@@ -598,16 +806,17 @@ class CurveEditorView(QGraphicsView):
                 is_start_endpoint=idx == 0,
                 is_end_endpoint=idx == last_idx,
             )
-            ni.setPos(self.value_x_to_scene(cn.x), self.value_y_to_scene(cn.y))
-            self._scene.addItem(ni)
+            ni.update_position()
+            ni.setParentItem(self._plot_layer)
+            ni.setSelected(id(cn) in selected_nodes)
             h_in = HandleItem(ni, True, self)
             h_out = HandleItem(ni, False, self)
             ni.handle_in = h_in
             ni.handle_out = h_out
-            self._scene.addItem(h_in)
-            self._scene.addItem(h_in.line)
-            self._scene.addItem(h_out)
-            self._scene.addItem(h_out.line)
+            h_in.setParentItem(self._plot_layer)
+            h_in.line.setParentItem(self._plot_layer)
+            h_out.setParentItem(self._plot_layer)
+            h_out.line.setParentItem(self._plot_layer)
             h_in.update_position()
             h_out.update_position()
             self._node_items.append(ni)
@@ -635,14 +844,13 @@ class CurveEditorView(QGraphicsView):
                 ni.handle_out.line.setVisible(show_out)
 
     def _text_value_at(self, vx: float) -> str:
-        nodes = sorted(self._nodes, key=lambda n: n.x)
-        chosen = nodes[0] if nodes else None
-        for node in nodes:
-            if vx >= node.x:
-                chosen = node
-            else:
-                break
-        return chosen.value_str if chosen else ""
+        return interpolate(self._nodes, vx, is_text=True)
+
+    def _inherit_segment(self, node: CurveNode) -> None:
+        previous = next((n for n in sorted(self._nodes, key=lambda n: n.x, reverse=True) if n.x < node.x), None)
+        if previous is not None:
+            node.segment_mode = previous.segment_mode
+            node.step_from_right = previous.step_from_right
 
     def add_node_at(self, vx: float, vy: float):
         vx = self._snap_x_value(vx)
@@ -652,7 +860,9 @@ class CurveEditorView(QGraphicsView):
         
         # Determine value_str if color mode by interpolating existing nodes
         if self._is_color:
-            color_val = interpolate(self._nodes, vx, self._default_mode, is_color=True)
+            color_val = interpolate(
+                self._nodes, vx, self._default_mode, is_color=True, color_space=self._color_space,
+            )
             cn.value_str = color_val
         elif self._is_text:
             cn.y = 0.0
@@ -662,10 +872,10 @@ class CurveEditorView(QGraphicsView):
         cn.handle_in_y = vy
         cn.handle_out_x = self._snap_x_value(vx + 5.0)
         cn.handle_out_y = vy
+        self._inherit_segment(cn)
         self._nodes.append(cn)
         self._nodes.sort(key=lambda n: n.x)
         self._rebuild_items()
-        self.curve_changed.emit()
 
     def add_batch_nodes(
         self,
@@ -702,7 +912,9 @@ class CurveEditorView(QGraphicsView):
             if any(abs(n.x - vx) < 0.001 for n in existing + new_nodes):
                 continue
             if self._is_color:
-                value = interpolate(self._nodes, vx, self._default_mode, is_color=True)
+                value = interpolate(
+                    self._nodes, vx, self._default_mode, is_color=True, color_space=self._color_space,
+                )
                 node = CurveNode(x=vx, y=0.0, value_str=str(value))
             elif self._is_text:
                 node = CurveNode(x=vx, y=0.0, value_str=self._text_value_at(vx))
@@ -720,6 +932,7 @@ class CurveEditorView(QGraphicsView):
             node.handle_in_y = node.y
             node.handle_out_x = self._snap_x_value(vx + 5.0)
             node.handle_out_y = node.y
+            self._inherit_segment(node)
             new_nodes.append(node)
 
         if not new_nodes:
@@ -728,13 +941,11 @@ class CurveEditorView(QGraphicsView):
         self._nodes.sort(key=lambda n: n.x)
         self.recalculate_bounds()
         self._rebuild_items()
-        self.curve_changed.emit()
 
     def remove_node(self, cn: CurveNode):
         if cn in self._nodes and cn is not self._nodes[0] and cn is not self._nodes[-1]:
             self._nodes.remove(cn)
             self._rebuild_items()
-            self.curve_changed.emit()
 
     # ── Curve drawing ────────────────────────────────────────────────────
     def _draw_color_band(self):
@@ -758,39 +969,33 @@ class CurveEditorView(QGraphicsView):
                 b, g, r = int(c_str[0:2], 16), int(c_str[2:4], 16), int(c_str[4:6], 16)
                 gradient.setColorAt(max(0.0, min(1.0, pos)), QColor(r, g, b))
         elif self._nodes:
-            for n in self._nodes:
-                c_str = n.value_str.ljust(6, '0') if n.value_str else "FFFFFF"
-                b, g, r = int(c_str[0:2], 16), int(c_str[2:4], 16), int(c_str[4:6], 16)
-                t = n.x / self._x_max
-                gradient.setColorAt(max(0.0, min(1.0, t)), QColor(r, g, b))
-                
+            # Sample each displayed column using the engine, including stepped
+            # segments; a Qt gradient would blend them again in RGB.
+            width = max(1, math.ceil(rect.width()))
+            image = QImage(width, 1, QImage.Format.Format_RGB32)
+            for pixel in range(width):
+                c_str = interpolate(
+                    self._nodes, (pixel + 0.5) / width * self._x_max,
+                    self._default_mode, is_color=True, color_space=self._color_space,
+                ) or "FFFFFF"
+                image.setPixelColor(pixel, 0, QColor(
+                    int(c_str[4:6], 16), int(c_str[2:4], 16), int(c_str[0:2], 16),
+                ))
+            self._color_band_item = self._scene.addPixmap(QPixmap.fromImage(image))
+            self._color_band_item.setPos(rect.topLeft())
+            self._color_band_item.setTransform(QTransform.fromScale(rect.width() / width, rect.height()))
+            self._color_band_item.setZValue(1)
+            self.viewport().update()
+            return
+
         self._color_band_item = self._scene.addRect(rect, QPen(Qt.PenStyle.NoPen), QBrush(gradient))
         self._color_band_item.setZValue(1)
         self.viewport().update()
 
     def mirror_horizontal(self):
-        old_nodes = sorted(self._nodes, key=lambda n: n.x)
-        if not old_nodes:
+        if not self._nodes:
             return
-        mirrored: list[CurveNode] = []
-        count = len(old_nodes)
-        for new_idx, old in enumerate(reversed(old_nodes)):
-            node = CurveNode(
-                x=self._x_max - old.x,
-                y=old.y,
-                value_str=old.value_str,
-                handle_in_x=self._x_max - old.handle_out_x,
-                handle_in_y=old.handle_out_y,
-                handle_out_x=self._x_max - old.handle_in_x,
-                handle_out_y=old.handle_in_y,
-            )
-            old_seg_idx = count - 2 - new_idx
-            node.segment_mode = (
-                old_nodes[old_seg_idx].segment_mode
-                if 0 <= old_seg_idx < count - 1 else None
-            )
-            mirrored.append(node)
-        self._nodes = mirrored
+        self._nodes = mirror_nodes_horizontal(self._nodes)
         self.recalculate_bounds()
         self._redraw_all()
 
@@ -843,12 +1048,54 @@ class CurveEditorView(QGraphicsView):
         pen = QPen(CURVE_COLOR, 2.5)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         self._curve_path = self._scene.addPath(path, pen)
+        self._curve_path.setParentItem(self._plot_layer)
         self._curve_path.setZValue(5)
         self._update_handle_visibility()
         self._draw_color_band()
-        self.curve_changed.emit()
+        self._notify_curve_change()
+
+    def _notify_curve_change(self):
+        # Geometry refreshes are not edits. Record blocked loads too, so the
+        # next resize cannot publish a tag switch as a new user modification.
+        state = (
+            self._is_color, self._is_text, self._default_mode,
+            tuple(tuple(vars(node).items()) for node in self._nodes),
+        )
+        if state != self._notified_curve_state:
+            self._notified_curve_state = state
+            self.curve_changed.emit()
+
+    def wheelEvent(self, event):
+        if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            super().wheelEvent(event)
+            return
+        event.accept()
+        if self._is_color or self._is_text or self._drag_active:
+            return
+        delta = event.angleDelta().y() or event.pixelDelta().y()
+        span = self._y_max - self._y_min
+        if not delta or not math.isfinite(span) or span <= 0:
+            return
+        steps = max(-20.0, min(20.0, delta / 120.0))
+        new_span = max(MIN_Y_VIEW_SPAN, min(MAX_Y_VIEW_SPAN, span * 1.2 ** -steps))
+        anchor = self.scene_y_to_value(self.mapToScene(event.position().toPoint()).y())
+        fraction = (anchor - self._y_min) / span
+        lo = anchor - fraction * new_span
+        hi = anchor + (1.0 - fraction) * new_span
+        if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+            return
+        self._manual_y_range = (lo, hi)
+        self.recalculate_bounds()
+        self._redraw_all()
 
     def mouseDoubleClickEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            event.accept()
+            if not self._drag_active:
+                self._manual_y_range = None
+                self.recalculate_bounds()
+                self._redraw_all()
+            return
         pos = self.mapToScene(event.pos())
         rect = self.plot_rect()
         if rect.contains(pos):
@@ -858,11 +1105,13 @@ class CurveEditorView(QGraphicsView):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        new_w = max(200, event.size().width() - MARGIN_LEFT - MARGIN_RIGHT)
-        if new_w != self._width:
-            self._width = new_w
+        viewport = self.viewport().size()
+        size = (max(1, viewport.width() - MARGIN_LEFT - MARGIN_RIGHT),
+                max(1, viewport.height() - MARGIN_TOP - MARGIN_BOTTOM))
+        if size != (self._width, self._height):
+            self._width, self._height = size
+            self._sync_scene_rect()
             self._redraw_all()
-        self.setSceneRect(self._scene.sceneRect())
 
 
 class BatchNodesDialog(QDialog):
@@ -983,6 +1232,7 @@ class CurveEditorWidget(QWidget):
         show_sample_editor: bool = True,
         integer_x: bool = False,
         integer_y: bool = False,
+        pin_endpoints_to_range: bool = True,
     ):
         super().__init__(parent)
         self._show_sample_editor = bool(show_sample_editor)
@@ -1039,7 +1289,7 @@ class CurveEditorWidget(QWidget):
         layout.addLayout(header)
 
         # Canvas
-        self._view = CurveEditorView()
+        self._view = CurveEditorView(pin_endpoints_to_range=pin_endpoints_to_range)
         self._view.set_integer_x(self._integer_x)
         self._view.set_integer_y(self._integer_y)
         self._view.curve_changed.connect(self.curve_changed.emit)
@@ -1114,6 +1364,9 @@ class CurveEditorWidget(QWidget):
         self._view.viewport().update()
         self._update_sample_editor_button()
 
+    def set_color_space(self, color_space: ColorSpace):
+        self._view.set_color_space(color_space)
+
     def _update_sample_editor_button(self):
         enabled = self._is_color_curve and self._sample_preview_count > 0
         self._sample_editor_btn.setEnabled(enabled)
@@ -1178,12 +1431,12 @@ class CurveEditorWidget(QWidget):
             x_max=self._view.x_max(),
             integer_x=self._integer_x,
             integer_y=self._integer_y,
+            pin_endpoints_to_range=self._view._pin_endpoints_to_range,
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._view.set_nodes(dialog.nodes())
-        self.curve_changed.emit()
 
     def _on_mirror_h_toggled(self, checked: bool):
         if self._syncing_mirror_buttons:

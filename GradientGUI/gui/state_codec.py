@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from engine.api import TagGradientConfig
 from engine.interpolation import CurveNode, InterpolationMode
 from engine.path_model import normalize_path_state, serialize_path_state
 from gui.undo_manager import UndoState
+from gui.preset_validation import validate_preset_sections
 
 
 PRESET_FORMAT = "GradientGUI Preset"
@@ -15,7 +17,7 @@ PRESET_SCHEMA_VERSION = 4
 
 
 def serialize_node(node: CurveNode) -> dict[str, Any]:
-    return {
+    data = {
         "x": node.x,
         "y": node.y,
         "value_str": node.value_str,
@@ -25,6 +27,9 @@ def serialize_node(node: CurveNode) -> dict[str, Any]:
         "hoy": node.handle_out_y,
         "seg_mode": node.segment_mode.value if node.segment_mode else None,
     }
+    if node.step_from_right:
+        data["step_from_right"] = True
+    return data
 
 
 def deserialize_node(data: dict[str, Any]) -> CurveNode:
@@ -32,6 +37,7 @@ def deserialize_node(data: dict[str, Any]) -> CurveNode:
         x=data["x"],
         y=data["y"],
         value_str=data.get("value_str", ""),
+        step_from_right=data.get("step_from_right", False),
     )
     node.handle_in_x = data["hix"]
     node.handle_in_y = data["hiy"]
@@ -80,10 +86,57 @@ def deserialize_tag_config(tag: str, data: dict[str, Any]) -> TagGradientConfig:
 
 
 def restore_tag_panel_configs(tag_panel, serialized_configs: dict[str, dict[str, Any]]) -> None:
-    for tag, data in serialized_configs.items():
-        row = tag_panel.get_row(tag)
-        if row:
-            row.set_config(deserialize_tag_config(tag, data))
+    configs = {
+        tag: deserialize_tag_config(tag, data)
+        for tag, data in serialized_configs.items()
+        if tag_panel.get_row(tag)
+    }
+    for tag, row in tag_panel._rows.items():
+        row.set_config(configs.get(tag, TagGradientConfig(tag=tag, enabled=False)))
+
+
+def split_coordinate_state(state: UndoState) -> UndoState:
+    """Expand older paired controls without changing the saved snapshot."""
+    if not any(tag in state.tag_configs for tag in ("pos", "org")):
+        return state
+    state = copy.deepcopy(state)
+
+    def expand_map(mapping):
+        for tag in ("pos", "org"):
+            if tag in mapping:
+                value = mapping.pop(tag)
+                for axis in ("x", "y"):
+                    mapping.setdefault(f"{tag}:{axis}", copy.deepcopy(value))
+
+    def expand_tags(tags):
+        return list(dict.fromkeys(key for tag in tags for key in (
+            (f"{tag}:x", f"{tag}:y") if tag in {"pos", "org"} else (tag,)
+        )))
+
+    for tag in ("pos", "org"):
+        config = state.tag_configs.pop(tag, None)
+        if config is None:
+            continue
+        for axis, field in (("x", "nodes"), ("y", "coord_y_nodes")):
+            key = f"{tag}:{axis}"
+            nodes = copy.deepcopy(config.get(field, []))
+            state.tag_configs.setdefault(key, {
+                "enabled": config["enabled"], "nodes": nodes,
+            })
+            if nodes:
+                state.tag_curves.setdefault(key, copy.deepcopy(nodes))
+            if axis == "y":
+                state.tag_modes.setdefault(key, config.get("coord_y_mode", InterpolationMode.LINEAR.value))
+    state.group_range_tags = expand_tags(state.group_range_tags)
+    if "enabled_tags" in state.animation_state:
+        state.animation_state["enabled_tags"] = expand_tags(state.animation_state["enabled_tags"])
+    for field in ("frame_steps", "seam_blend_lengths"):
+        expand_map(state.animation_state.get(field, {}))
+    for mapping in (state.animation_curves, state.animation_modes, state.animation_curve_mirrors):
+        expand_map(mapping)
+    if state.active_curve_key in {"pos", "org"}:
+        state.active_curve_key += ":x"
+    return state
 
 
 def serialize_curve_store(
@@ -176,8 +229,10 @@ def state_from_preset_data(data: dict[str, Any]) -> UndoState:
         raise ValueError("不是 GradientGUI 预设文件。")
 
     version = data.get("version")
-    if version != PRESET_SCHEMA_VERSION:
+    if type(version) is not int or version != PRESET_SCHEMA_VERSION:
         raise ValueError(f"不支持的预设版本: {version}")
+
+    validate_preset_sections(data)
 
     tags = _dict_section(data, "tags")
     curves = _dict_section(data, "curves")

@@ -41,7 +41,9 @@ def parse_clip_shape(content: str) -> Optional[dict[str, Any]]:
             "color": "#ff4050",
         }
 
+    factor = 1.0
     if tokens and tokens[0].isdigit():
+        factor = float(2 ** max(int(tokens[0]) - 1, 0))
         tokens = tokens[1:]
     points: list[Point] = []
     i = 0
@@ -53,11 +55,11 @@ def parse_clip_shape(content: str) -> Optional[dict[str, Any]]:
             i += 1
             continue
         if cmd in {"m", "n", "l"} and i + 1 < len(tokens) and _all_number(tokens[i:i + 2]):
-            points.append((float(tokens[i]), float(tokens[i + 1])))
+            points.append((float(tokens[i]) / factor, float(tokens[i + 1]) / factor))
             i += 2
             continue
         if cmd == "b" and i + 5 < len(tokens) and _all_number(tokens[i:i + 6]):
-            points.append((float(tokens[i + 4]), float(tokens[i + 5])))
+            points.append((float(tokens[i + 4]) / factor, float(tokens[i + 5]) / factor))
             i += 6
             continue
         i += 1

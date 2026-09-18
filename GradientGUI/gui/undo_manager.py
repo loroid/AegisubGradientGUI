@@ -7,8 +7,6 @@ Each snapshot captures all tag configs, curve nodes, and settings.
 
 from __future__ import annotations
 
-import copy
-import json
 from dataclasses import dataclass, field
 from typing import Optional, Any, Callable
 
@@ -63,21 +61,27 @@ class UndoManager:
         if self._on_change:
             self._on_change()
 
-    def undo(self) -> Optional[UndoState]:
-        """Undo: pop from undo stack, push current to redo."""
+    def undo(self, *, restore: Optional[Callable[[UndoState], None]] = None) -> Optional[UndoState]:
+        """Restore the previous state before committing the history move."""
         if len(self._undo_stack) < 2:
             return None  # Need at least 2 states (current + previous)
+        state = self._undo_stack[-2]
+        if restore is not None:
+            restore(state)
         current = self._undo_stack.pop()
         self._redo_stack.append(current)
         if self._on_change:
             self._on_change()
-        return self._undo_stack[-1] if self._undo_stack else None
+        return state
 
-    def redo(self) -> Optional[UndoState]:
-        """Redo: pop from redo stack, push to undo."""
+    def redo(self, *, restore: Optional[Callable[[UndoState], None]] = None) -> Optional[UndoState]:
+        """Restore the next state before committing the history move."""
         if not self._redo_stack:
             return None
-        state = self._redo_stack.pop()
+        state = self._redo_stack[-1]
+        if restore is not None:
+            restore(state)
+        self._redo_stack.pop()
         self._undo_stack.append(state)
         if self._on_change:
             self._on_change()

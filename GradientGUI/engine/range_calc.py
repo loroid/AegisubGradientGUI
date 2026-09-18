@@ -9,7 +9,13 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from .ass_parser import ASSEvent, ASSStyle, ASSFile
-from .interpolation import interpolate, make_default_nodes
+from .interpolation import (
+    InterpolationMode,
+    interpolate,
+    make_default_nodes,
+    numeric_curve_bounds,
+    numeric_curve_sample_positions,
+)
 from .libass_bounds import (
     IMAGE_TYPE_CHARACTER,
     IMAGE_TYPE_OUTLINE,
@@ -21,6 +27,8 @@ from .path_tracer import project_bounds
 from .tag_parser import (
     TAG_INFO,
     build_tag_string,
+    build_override_tags,
+    resolve_coordinate_overrides,
     get_bord_sizes,
     get_shad_offsets,
     get_tag_value,
@@ -243,7 +251,7 @@ def compute_effect_extents(
             if min_value is not None:
                 base_val = max(float(min_value), float(base_val))
             return base_val, base_val
-        y_vals = [float(n.y) for n in cfg.nodes]
+        y_vals = numeric_curve_bounds(cfg.nodes, cfg.mode)
         if min_value is not None:
             y_vals = [max(float(min_value), v) for v in y_vals]
         return min(y_vals), max(y_vals)
@@ -725,15 +733,9 @@ def compute_libass_projected_range(
         return min(g_vals), max(g_vals), min(p_vals), max(p_vals)
 
     try:
-        start = project_bounds_at(0.0)
-        end = project_bounds_at(1.0)
-        if start is None or end is None:
-            return None
-
-        g_min = min(start[0], start[1], end[0], end[1])
-        g_max = max(start[0], start[1], end[0], end[1])
-        p_min = min(start[2], end[2])
-        p_max = max(start[3], end[3])
+        # Zero scale or off-screen endpoints can still have a visible interior.
+        g_min = p_min = math.inf
+        g_max = p_max = -math.inf
         for t in render_measure_sample_points(enabled_tags):
             measured = project_bounds_at(t)
             if measured is None:
@@ -916,24 +918,49 @@ def render_measure_sample_points(enabled_tags: dict[str, Any]) -> list[float]:
     for i in range(1, 8):
         points.add(i / 8.0)
     for cfg in enabled_tags.values():
-        if cfg and getattr(cfg, "nodes", None):
-            for node in cfg.nodes:
-                points.add(max(0.0, min(1.0, node.x / 100.0)))
-        if cfg and getattr(cfg, "coord_y_nodes", None):
-            for node in cfg.coord_y_nodes:
-                points.add(max(0.0, min(1.0, node.x / 100.0)))
+        points.update(_config_curve_sample_points(cfg))
     return sorted(points)
+
+
+def _config_curve_sample_points(cfg: Any) -> set[float]:
+    points = set()
+    for nodes_attr, mode_attr in (("nodes", "mode"), ("coord_y_nodes", "coord_y_mode")):
+        nodes = getattr(cfg, nodes_attr, None)
+        if nodes:
+            mode = getattr(cfg, mode_attr, InterpolationMode.LINEAR)
+            # Color and font curves use string interpolation, not numeric Y.
+            if TAG_INFO.get(getattr(cfg, "tag", ""), {}).get("type") in {"color", "text"}:
+                positions = [node.x for node in nodes]
+            else:
+                positions = numeric_curve_sample_positions(nodes, mode)
+            points.update(max(0.0, min(1.0, x / 100.0)) for x in positions)
+    return points
 
 
 def coord_sample_points(cfg: Any) -> list[float]:
     points = {0.0, 1.0}
     for i in range(41):
         points.add(i / 40.0)
-    for node in getattr(cfg, "nodes", []) or []:
-        points.add(max(0.0, min(1.0, node.x / 100.0)))
-    for node in getattr(cfg, "coord_y_nodes", []) or []:
-        points.add(max(0.0, min(1.0, node.x / 100.0)))
+    points.update(_config_curve_sample_points(cfg))
     return sorted(points)
+
+
+def position_range(
+    enabled_tags: dict[str, Any], parsed: dict, style: Optional[ASSStyle],
+    settings: Any, base_pos: tuple[float, float],
+) -> tuple[float, float, float, float]:
+    """Measure both enabled position axes while preserving the source anchor."""
+    configs = {tag: cfg for tag, cfg in enabled_tags.items()
+               if tag in {"pos", "pos:x", "pos:y"} and cfg.nodes}
+    if not configs:
+        return base_pos[0], base_pos[0], base_pos[1], base_pos[1]
+    positions = []
+    for t in sorted({t for cfg in configs.values() for t in coord_sample_points(cfg)}):
+        values = {tag: get_interpolated_value(tag, cfg, t, parsed, style, settings)
+                  for tag, cfg in configs.items()}
+        positions.append(resolve_coordinate_overrides(values, {**parsed, "pos": base_pos}, style)["pos"])
+    xs, ys = zip(*positions)
+    return min(xs), max(xs), min(ys), max(ys)
 
 
 def event_with_interpolated_geometry(
@@ -945,14 +972,15 @@ def event_with_interpolated_geometry(
     t: float,
 ) -> ASSEvent:
     text = re.sub(r"\\i?clip\([^)]*\)", "", event.text)
-    tag_str = ""
+    values = {}
     for tag_name in tags_to_remove_for_overrides(enabled_tags):
         text = remove_specific_tag(text, tag_name)
     for tag_name, cfg in enabled_tags.items():
         if tag_name in SHADOW_TAGS:
             continue
         value = get_interpolated_value(tag_name, cfg, t, parsed, style, settings)
-        tag_str += build_tag_string(tag_name, value)
+        values[tag_name] = value
+    tag_str = build_override_tags(values, parsed, style)
     tag_str += build_shadow_override_tags(
         enabled_tags, parsed, style, settings, lambda _tag: t
     )
@@ -1027,10 +1055,7 @@ def geometry_sample_points(enabled_tags: dict[str, Any]) -> list[float]:
     for i in range(41):
         points.add(i / 40.0)
     for tag in GEOMETRY_TAGS:
-        cfg = enabled_tags.get(tag)
-        if cfg and getattr(cfg, "nodes", None):
-            for node in cfg.nodes:
-                points.add(max(0.0, min(1.0, node.x / 100.0)))
+        points.update(_config_curve_sample_points(enabled_tags.get(tag)))
     return sorted(points)
 
 
@@ -1154,14 +1179,7 @@ def get_interpolated_value(
         a = max(0, min(255, int(y_val + 0.5)))
         return f"{a:02X}"
     if tag_type == "text":
-        nodes = sorted(cfg.nodes, key=lambda node: node.x)
-        chosen = nodes[0]
-        for node in nodes:
-            if x_pos >= node.x:
-                chosen = node
-            else:
-                break
-        return chosen.value_str or get_tag_value(tag_name, parsed_tags, style)
+        return interpolate(cfg.nodes, x_pos, is_text=True) or get_tag_value(tag_name, parsed_tags, style)
     if tag_type == "coord":
         base = get_tag_value(tag_name, parsed_tags, style)
         if isinstance(base, tuple) and len(base) >= 2:

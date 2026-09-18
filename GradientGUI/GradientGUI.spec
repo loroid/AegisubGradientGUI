@@ -81,6 +81,15 @@ a = Analysis(
     noarchive=False,
 )
 
+if is_windows:
+    # Qt uses Windows' system ICU. PATH may contain incompatible same-name
+    # Conda/tool DLLs, which must not shadow the OS library in a frozen app.
+    a.binaries = [
+        entry for entry in a.binaries
+        if os.path.basename(entry[0]).lower() not in {'icu.dll', 'icuuc.dll', 'icuin.dll'}
+        and not os.path.basename(entry[0]).lower().startswith('icudt')
+    ]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(

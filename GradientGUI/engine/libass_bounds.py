@@ -18,7 +18,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .ass_parser import ASSFile, ASSEvent, EVENT_FIELDS, STYLE_FIELDS, time_to_seconds
+from .ass_parser import ASSFile, ASSEvent, time_to_seconds
 from .tag_parser import parse_tags_from_text
 
 
@@ -314,25 +314,7 @@ def _configure_library(lib, library) -> None:
 
 
 def _build_single_event_ass(ass_file: ASSFile, event: ASSEvent) -> str:
-    lines: list[str] = ["[Script Info]"]
-    script_info = dict(ass_file.script_info)
-    script_info.setdefault("ScriptType", "v4.00+")
-    script_info.setdefault("PlayResX", str(ass_file.play_res_x or 1920))
-    script_info.setdefault("PlayResY", str(ass_file.play_res_y or 1080))
-    for key, value in script_info.items():
-        lines.append(f"{key}: {value}")
-
-    lines.extend(["", "[V4+ Styles]"])
-    lines.append(ass_file.styles_format or "Format: " + ", ".join(STYLE_FIELDS))
-    for style in ass_file.styles:
-        if style.raw:
-            lines.append(style.raw)
-
-    lines.extend(["", "[Events]"])
-    lines.append(ass_file.events_format or "Format: " + ", ".join(EVENT_FIELDS))
-    lines.append(event.to_ass_line())
-    lines.append("")
-    return "\n".join(lines)
+    return ass_file.to_render_string([event])
 
 
 def _scan_image_list(

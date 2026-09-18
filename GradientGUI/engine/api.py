@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .gradient import GradientTagError, generate_gradient
+from .gradient import GradientTagError, generate_gradient, implicit_static_position
 from .models import AnimationSettings, GradientMode, GradientSettings, TagGradientConfig
 from .path_sampling_cache import get_cached_path_color_map
 from .path_tracer import (
@@ -181,4 +181,5 @@ __all__ = [
     "get_path_color_sample_count",
     "sample_path_points_from_path",
     "generate_gradient",
+    "implicit_static_position",
 ]

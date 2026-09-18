@@ -33,9 +33,8 @@ class VectorClipTest(unittest.TestCase):
         )
 
         self.assertIsNotNone(clip)
-        self.assertIn(r"\clip(1,m", clip)
-        self.assertIn("25", clip)
-        self.assertIn("75", clip)
+        self.assertIn(r"\clip(7,m", clip)
+        self.assertEqual(extract_clip_bounds("{" + clip + "}Text"), (25, 0, 75, 100))
 
     def test_inverse_vector_clip_subtracts_shape_from_strip(self) -> None:
         source = extract_source_vector_clip(
@@ -51,8 +50,8 @@ class VectorClipTest(unittest.TestCase):
 
         self.assertIsNotNone(clip)
         self.assertEqual(clip.count("m "), 2)
-        self.assertIn("40", clip)
-        self.assertIn("60", clip)
+        polygons = parse_vector_clip_content(clip[6:-1]).polygons
+        self.assertEqual({x for x, _ in polygons[1]}, {40, 60})
 
     def test_inverse_rectangle_clip_is_converted_to_split_vector_clip(self) -> None:
         source = extract_source_vector_clip(r"{\iclip(40,0,60,100)}Text")
@@ -106,7 +105,7 @@ class VectorClipTest(unittest.TestCase):
 
         self.assertGreater(len(generated), 1)
         for strip in generated:
-            self.assertRegex(strip.text, r"\\clip\(1,m ")
+            self.assertRegex(strip.text, r"\\clip\(7,m ")
             self.assertNotRegex(strip.text, r"\\clip\(\d+(?:\.\d+)?,\d+(?:\.\d+)?,")
 
     def test_generated_strips_preserve_source_inverse_vector_clip(self) -> None:
@@ -145,7 +144,7 @@ class VectorClipTest(unittest.TestCase):
         self.assertGreater(len(generated), 1)
         self.assertTrue(any(strip.text.count("m ") >= 2 for strip in generated))
         for strip in generated:
-            self.assertRegex(strip.text, r"\\clip\(1,m ")
+            self.assertRegex(strip.text, r"\\clip\(7,m ")
             self.assertNotIn(r"\iclip", strip.text)
 
 

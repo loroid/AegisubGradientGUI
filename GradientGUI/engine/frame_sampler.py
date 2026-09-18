@@ -71,8 +71,7 @@ class FrameSampler:
         cache_key = ("time", video_path, time_key)
         if (
             self._current_video == video_path
-            and self._current_time is not None
-            and abs(self._current_time - time_key) < 0.01
+            and self._current_time == time_key
             and self._image is not None
         ):
             self.last_error = ""

@@ -12,13 +12,15 @@ from typing import Callable, Optional
 
 from engine.api import GradientSettings, GradientTagError, generate_gradient
 from engine.ass_parser import ASSFile, ASSEvent, seconds_to_time, time_to_seconds
+from engine.ass_timing import retime_event_text
 from engine.interpolation import InterpolationMode, interpolate
 from engine.models import GradientMode
-from engine.range_calc import GEOMETRY_TAGS, compute_gradient_direction
+from engine.range_calc import compute_gradient_direction
 from engine.tag_parser import (
     ALPHA_TAGS,
     NUMERIC_TAGS,
     TAG_INFO,
+    build_tag_string,
     extract_clip_bounds,
     get_tag_value,
     parse_tags_from_text,
@@ -30,7 +32,6 @@ BoundsResolver = Callable[[int], Optional[str]]
 SettingsFactory = Callable[[GradientSettings, int], GradientSettings]
 COLOR_TAGS = {"1c", "2c", "3c", "4c"}
 TRANSFORMABLE_ANIMATION_TAGS = COLOR_TAGS | set(ALPHA_TAGS) | set(NUMERIC_TAGS)
-TRANSFORM_TARGET_CACHE_CONTEXT_TAGS = set(GEOMETRY_TAGS)
 _GROUP_RESOLVER_CACHE_MAX = 32
 _GROUP_RESOLVER_CACHE: OrderedDict[str, _GroupTransformTargetResolver] = OrderedDict()
 
@@ -308,6 +309,7 @@ def _generate_event_with_split_animation(
             return fast_result
 
     return _generate_event_with_slow_split_animation(
+        evt,
         style,
         settings,
         base_meta,
@@ -317,6 +319,7 @@ def _generate_event_with_split_animation(
 
 
 def _generate_event_with_slow_split_animation(
+    evt: ASSEvent,
     style,
     settings: GradientSettings,
     base_meta: Optional[str],
@@ -328,9 +331,23 @@ def _generate_event_with_slow_split_animation(
         segment_settings = copy.deepcopy(settings)
         _apply_segment_shift(segment_settings, segment)
         result.extend(
-            generate_gradient(segment.event, style, segment_settings, base_meta, ass_file)
+            _slice_generated_event(generated, segment)
+            for generated in generate_gradient(evt, style, segment_settings, base_meta, ass_file)
         )
     return result
+
+
+def _slice_generated_event(evt: ASSEvent, segment: _AnimationSegment) -> ASSEvent:
+    sliced = copy.copy(evt)
+    sliced.start = segment.event.start
+    sliced.end = segment.event.end
+    source_start = _event_time_to_ms(evt.start)
+    sliced.text = retime_event_text(
+        evt.text,
+        _event_time_to_ms(sliced.start) - source_start,
+        _event_time_to_ms(evt.end) - source_start,
+    )
+    return sliced
 
 
 def _can_fast_split_animation(settings: GradientSettings, active_tags: list[str]) -> bool:
@@ -354,10 +371,10 @@ def _generate_event_with_fast_split_animation(
     base_settings = copy.deepcopy(settings)
     _apply_segment_shift(base_settings, segments[0])
     base_events = generate_gradient(
-        segments[0].event, style, base_settings, base_meta, ass_file
+        evt, style, base_settings, base_meta, ass_file
     )
     if len(segments) <= 1 or not base_events:
-        return base_events
+        return [_slice_generated_event(event, segments[0]) for event in base_events]
 
     base_shift_map = _segment_shift_map(segments[0], active_tags)
     group_resolver = _build_group_transform_target_resolver(
@@ -387,8 +404,6 @@ def _generate_event_with_fast_split_animation(
         same_shift = _same_shift_map(shift_map, base_shift_map)
         for idx, base_event in enumerate(base_events):
             event_copy = copy.copy(base_event)
-            event_copy.start = segment.event.start
-            event_copy.end = segment.event.end
             if not same_shift:
                 tag_values = {}
                 if group_resolver:
@@ -404,7 +419,7 @@ def _generate_event_with_fast_split_animation(
                     event_copy.text,
                     tag_values,
                 )
-            result.append(event_copy)
+            result.append(_slice_generated_event(event_copy, segment))
     return result
 
 
@@ -601,72 +616,18 @@ def _group_transform_resolver_cache_key(
     base_meta: Optional[str],
     active_tags: list[str],
 ) -> str:
-    tags = sorted(set(active_tags))
-    context_tags = _transform_target_cache_context_tags(settings, tags)
-    tag_configs = {
-        tag: settings.tags.get(tag)
-        for tag in context_tags
-        if settings.tags.get(tag) is not None
-    }
-    animation = getattr(settings, "animation", None)
-    seam_lengths = getattr(animation, "seam_blend_lengths", {}) or {}
+    # Hash the complete generation inputs: a partial field list can reuse
+    # targets from old saved samples, styles, or per-tag settings.
     return stable_preview_key(
         {
-            "version": 2,
-            "event_text": evt.text,
-            "event_style": evt.style,
+            "version": 3,
+            "event": evt,
+            "style": style,
+            "settings": settings,
             "base_meta": base_meta,
-            "style": getattr(style, "raw", None) or getattr(style, "name", None),
-            "mode": getattr(settings.mode, "value", str(settings.mode)),
-            "angle": settings.angle,
-            "step": settings.step,
-            "color_space": getattr(settings.color_space, "value", str(settings.color_space)),
-            "group_range_bounds": settings.group_range_bounds,
-            "group_range_tags": sorted(set(getattr(settings, "group_range_tags", set()) or [])),
-            "active_tags": tags,
-            "context_tags": context_tags,
-            "tag_configs": tag_configs,
-            "video_path": settings.video_path,
-            "video_frame": settings.video_frame,
-            "video_time": settings.video_time,
-            "sampling_paths": {
-                tag: (getattr(settings, "sampling_paths", {}) or {}).get(tag, "")
-                for tag in tags
-            },
-            "path_smooth": {
-                tag: (getattr(settings, "path_sampling_smooth", {}) or {}).get(tag, False)
-                for tag in tags
-            },
-            "path_smooth_strength": {
-                tag: (getattr(settings, "path_sampling_smooth_strength", {}) or {}).get(tag, 1.0)
-                for tag in tags
-            },
-            "path_mirror": {
-                tag: (getattr(settings, "path_sampling_mirror", {}) or {}).get(tag, False)
-                for tag in tags
-            },
-            "seam_blend_length": getattr(animation, "seam_blend_length", 0),
-            "seam_blend_lengths": {
-                tag: seam_lengths.get(tag, 0)
-                for tag in tags
-            },
+            "active_tags": sorted(set(active_tags)),
         }
     )
-
-
-def _transform_target_cache_context_tags(
-    settings: GradientSettings,
-    active_tags: list[str],
-) -> list[str]:
-    """Tags that invalidate cached targets without joining the color sequence."""
-
-    tags = set(active_tags)
-    for tag, cfg in settings.tags.items():
-        if tag not in TRANSFORM_TARGET_CACHE_CONTEXT_TAGS:
-            continue
-        if getattr(cfg, "enabled", False):
-            tags.add(tag)
-    return sorted(tags)
 
 
 def _group_sequence_base_meta(
@@ -747,10 +708,12 @@ def _clip_axis_position(text: str, direction) -> Optional[float]:
         )
 
     coord_tokens = tokens
+    factor = 1.0
     if coord_tokens:
         try:
-            float(coord_tokens[0])
+            scale = int(float(coord_tokens[0]))
             if len(coord_tokens) > 1 and coord_tokens[1].lower() in {"m", "n", "l", "b", "s", "p", "c"}:
+                factor = float(2 ** max(scale - 1, 0))
                 coord_tokens = coord_tokens[1:]
         except ValueError:
             pass
@@ -761,8 +724,8 @@ def _clip_axis_position(text: str, direction) -> Optional[float]:
         if idx + 2 >= len(coord_tokens):
             continue
         try:
-            x = float(coord_tokens[idx + 1])
-            y = float(coord_tokens[idx + 2])
+            x = float(coord_tokens[idx + 1]) / factor
+            y = float(coord_tokens[idx + 2]) / factor
         except ValueError:
             continue
         return x * direction.cos_a + y * direction.sin_a
@@ -836,12 +799,29 @@ def _interpolate_tag_value(tag: str, left: str, right: str, t: float) -> str:
         if left_alpha and right_alpha:
             return f"\\{tag}&H{_interpolate_hex(left_alpha, right_alpha, t)}&"
         return ""
+    if tag == "shad" and any(
+        f"\\{axis}" in text
+        for axis in ("xshad", "yshad") for text in (left, right)
+    ):
+        # Negative shad is serialized as separate X/Y offsets.
+        parts = []
+        for axis in ("xshad", "yshad"):
+            left_num = _extract_numeric_tag_value(axis, left)
+            right_num = _extract_numeric_tag_value(axis, right)
+            if left_num is None:
+                left_num = _extract_numeric_tag_value("shad", left)
+            if right_num is None:
+                right_num = _extract_numeric_tag_value("shad", right)
+            if left_num is None or right_num is None:
+                return ""
+            parts.append(build_tag_string(axis, left_num + (right_num - left_num) * t))
+        return "".join(parts)
     if tag in NUMERIC_TAGS:
         left_num = _extract_numeric_tag_value(tag, left)
         right_num = _extract_numeric_tag_value(tag, right)
         if left_num is not None and right_num is not None:
             value = left_num + (right_num - left_num) * t
-            return f"\\{tag}{_format_number(value)}"
+            return build_tag_string(tag, value)
     return ""
 
 
@@ -867,12 +847,6 @@ def _extract_numeric_tag_value(tag: str, text: str) -> Optional[float]:
         return float(match.group(1))
     except ValueError:
         return None
-
-
-def _format_number(value: float) -> str:
-    if abs(value - round(value)) < 1e-6:
-        return str(int(round(value)))
-    return f"{value:.2f}"
 
 
 def _rotated_transform_tag_values(
@@ -1325,22 +1299,4 @@ def compose_preview_events(
 
 def build_preview_ass(ass_file: ASSFile, events: list[ASSEvent]) -> str:
     """Build a minimal ASS document for preview rendering."""
-
-    lines: list[str] = []
-    lines.append("[Script Info]")
-    for key, value in ass_file.script_info.items():
-        lines.append(f"{key}: {value}")
-    lines.append("")
-    lines.append("[V4+ Styles]")
-    if ass_file.styles_format:
-        lines.append(ass_file.styles_format)
-    for style in ass_file.styles:
-        lines.append(style.raw)
-    lines.append("")
-    lines.append("[Events]")
-    if ass_file.events_format:
-        lines.append(ass_file.events_format)
-    for event in events:
-        lines.append(event.to_ass_line())
-    lines.append("")
-    return "\n".join(lines)
+    return ass_file.to_render_string(events)

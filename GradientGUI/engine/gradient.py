@@ -14,8 +14,9 @@ from typing import Optional
 
 from .ass_parser import ASSEvent, ASSStyle, ASSFile
 from .tag_parser import (
-    parse_tags_from_text, get_tag_value, strip_tags,
+    parse_tags_from_text, get_tag_value,
     build_tag_string, remove_specific_tag,
+    resolve_coordinate_overrides,
 )
 from .frame_sampler import FrameSampler
 from .path_tracer import get_color_by_ratio, project_bounds
@@ -23,7 +24,9 @@ from .path_sampling_cache import (
     frame_key_from_video_position,
     get_cached_path_color_map,
 )
-from .vector_clip import extract_source_vector_clip, vector_clip_tag_for_strip
+from .vector_clip import (
+    extract_source_vector_clip, vector_clip_from_polygons, vector_clip_tag_for_strip,
+)
 from .tag_parser import extract_clip_bounds, extract_clip_tags, get_bord_sizes, get_shad_offsets
 from .models import (
     ChannelSamplingData,
@@ -38,7 +41,7 @@ from .range_calc import (
     build_geometry_context as _range_build_geometry_context,
     build_shadow_override_tags as _build_shadow_override_tags,
     calculate_range_plan,
-    coord_sample_points as _range_coord_sample_points,
+    position_range,
     compute_dynamic_geometry_bounds as _range_compute_dynamic_geometry_bounds,
     get_interpolated_value as _range_get_interpolated_value,
     get_interpolated_value as _get_interpolated_value,
@@ -94,13 +97,14 @@ def _position_from_bounds_meta(base_bounds_meta: Optional[str]) -> Optional[tupl
         return None
 
 
-def _implicit_static_position(
+def implicit_static_position(
     event: ASSEvent,
     style: Optional[ASSStyle],
     ass_file: Optional[ASSFile],
     parsed: dict,
     base_bounds_meta: Optional[str],
 ) -> Optional[tuple[float, float]]:
+    """Resolve an unpositioned line's anchor for both controls and output."""
     if parsed.get("pos") or _MOVE_RE.search(event.text or ""):
         return None
     meta_pos = _position_from_bounds_meta(base_bounds_meta)
@@ -228,23 +232,6 @@ def _color_shift_for(settings: GradientSettings, tag_name: Optional[str] = None)
         return 0.0
 
 
-def _color_shifted_t(
-    t: float,
-    settings: GradientSettings,
-    shift_divisor: float,
-    tag_name: Optional[str] = None,
-) -> float:
-    """Apply cyclic color-band phase shift measured in generated strip cells."""
-
-    shift = _color_shift_for(settings, tag_name)
-    t = max(0.0, min(1.0, float(t)))
-    if abs(shift) < 1e-9:
-        return t
-    divisor = max(float(shift_divisor), 1.0)
-    shifted = t - shift / divisor
-    return shifted - math.floor(shifted)
-
-
 def _color_shifted_strip_t(
     t: float,
     settings: GradientSettings,
@@ -293,7 +280,7 @@ def generate_gradient(
         return [event]
 
     if settings.mode == GradientMode.GBC:
-        return _generate_gbc(event, style, settings, enabled_tags, base_bounds_meta)
+        return _generate_gbc(event, style, settings, enabled_tags, base_bounds_meta, ass_file)
     else:
         return _generate_strips(event, style, settings, enabled_tags, base_bounds_meta, ass_file)
 
@@ -317,7 +304,7 @@ def _generate_strips(
     parsed = parse_tags_from_text(event.text) or {}
     source_clip_bounds = extract_clip_bounds(event.text)
     source_vector_clip = extract_source_vector_clip(event.text)
-    implicit_pos = _implicit_static_position(
+    implicit_pos = implicit_static_position(
         event, style, ass_file, parsed, base_bounds_meta
     )
     if implicit_pos is not None:
@@ -361,23 +348,9 @@ def _generate_strips(
                 nx1, ny1, nx2, ny2 = bx1, by1, bx2, by2
 
             # Try to account for position animation
-            def _get_pos_range():
-                cfg = enabled_tags.get("pos")
-                if cfg and cfg.nodes:
-                    xs: list[float] = []
-                    ys: list[float] = []
-                    for t in _range_coord_sample_points(cfg):
-                        value = _range_get_interpolated_value(
-                            "pos", cfg, t, parsed, style, settings
-                        )
-                        if isinstance(value, tuple) and len(value) >= 2:
-                            xs.append(float(value[0]))
-                            ys.append(float(value[1]))
-                    if xs and ys:
-                        return min(xs), max(xs), min(ys), max(ys)
-                return render_x, render_x, render_y, render_y
-            
-            min_px, max_px, min_py, max_py = _get_pos_range()
+            min_px, max_px, min_py, max_py = position_range(
+                enabled_tags, parsed, style, settings, (render_x, render_y)
+            )
             dx_min, dx_max = min_px - render_x, max_px - render_x
             dy_min, dy_max = min_py - render_y, max_py - render_y
 
@@ -429,7 +402,7 @@ def _generate_strips(
                 clips.pop(tag, None)
     sampling_data: dict[str, ChannelSamplingData] = {}
     
-    if clips and settings.video_path:
+    if clips:
         xbord, ybord = get_bord_sizes(clean_text, style)
         xshad, yshad = get_shad_offsets(clean_text, style)
 
@@ -659,7 +632,7 @@ def _generate_strips(
             return value_pos
 
         # Build override tags for this strip
-        tag_str = ""
+        override_values = {}
         for tag_name, cfg in enabled_tags.items():
             if tag_name in SHADOW_TAGS:
                 continue
@@ -715,7 +688,7 @@ def _generate_strips(
                         force_discrete=original_path_sampling,
                     )
                     val = _get_interpolated_value(tag_name, cfg, tag_t, parsed, style, settings)
-                tag_str += build_tag_string(tag_name, val)
+                override_values[tag_name] = val
             except Exception as exc:
                 raise GradientTagError(
                     tag_name,
@@ -724,6 +697,8 @@ def _generate_strips(
                     position=j,
                     original=exc,
                 ) from exc
+        resolved_values = resolve_coordinate_overrides(override_values, parsed, style)
+        tag_str = _serialize_override_values(resolved_values, strip_index, j)
         try:
             tag_str += _build_shadow_override_tags(
                 enabled_tags,
@@ -754,24 +729,11 @@ def _generate_strips(
 
         # Handle \pos offset for strip if pos is being gradiented
         pos_offset = None
-        if "pos" in enabled_tags:
+        if "pos" in resolved_values:
             interp_pos = None
             try:
                 base_pos = get_tag_value("pos", parsed, style)
-                pos_axis_pos = _axis_pos_for_tag("pos")
-                pos_t = _shifted_strip_t_for_tag(
-                    "pos",
-                    _tag_t_for("pos", pos_axis_pos),
-                    pos_axis_pos,
-                    strip_index,
-                    color_shift_slots,
-                    include_endpoint=path_sampling,
-                    force_discrete=original_path_sampling,
-                )
-                interp_pos = _get_interpolated_value(
-                    "pos", enabled_tags["pos"], pos_t,
-                    parsed, style, settings,
-                )
+                interp_pos = resolved_values["pos"]
                 if isinstance(base_pos, tuple) and isinstance(interp_pos, tuple):
                     pos_offset = (interp_pos[0] - base_pos[0], interp_pos[1] - base_pos[1])
             except Exception as exc:
@@ -822,13 +784,8 @@ def _generate_strips(
                 cx3 += dx; cy3 += dy
                 cx4 += dx; cy4 += dy
 
-            clip_str = (
-                f"\\clip(1,m {cx1:.0f} {cy1:.0f} "
-                f"l {cx2:.0f} {cy2:.0f} "
-                f"l {cx3:.0f} {cy3:.0f} "
-                f"l {cx4:.0f} {cy4:.0f})"
-            )
             strip_polygon = [(cx1, cy1), (cx2, cy2), (cx3, cy3), (cx4, cy4)]
+            clip_str = vector_clip_from_polygons([strip_polygon])
 
         if source_vector_clip is not None and strip_polygon is not None:
             clip_str = vector_clip_tag_for_strip(
@@ -844,23 +801,11 @@ def _generate_strips(
                 continue
 
         # Insert tags and clip into the text
-        if implicit_pos is not None and "pos" not in enabled_tags:
+        if implicit_pos is not None and "pos" not in resolved_values:
             tag_str += build_tag_string("pos", implicit_pos)
         strip_text = _insert_tags(clean_text, tag_str + clip_str)
 
-        new_event = ASSEvent(
-            layer=event.layer,
-            start=event.start,
-            end=event.end,
-            style=event.style,
-            name=event.name,
-            margin_l=event.margin_l,
-            margin_r=event.margin_r,
-            margin_v=event.margin_v,
-            effect=event.effect,
-            text=strip_text,
-            comment=False,
-        )
+        new_event = replace(event, text=strip_text, comment=False)
         results.append(new_event)
         if original_path_sampling:
             strip_index += 1
@@ -872,12 +817,60 @@ def _generate_strips(
 
 # ── GBC (Gradient by Character) ──────────────────────────────────────────────
 
+def _serialize_override_values(values: dict, strip_index: int, position: float) -> str:
+    parts = []
+    for tag, value in values.items():
+        try:
+            parts.append(build_tag_string(tag, value))
+        except Exception as exc:
+            raise GradientTagError(tag, value=value, strip_index=strip_index,
+                                   position=position, original=exc) from exc
+    return "".join(parts)
+
+
+def _iter_gbc_text_tokens(text: str):
+    """Yield ASS text tokens and whether each token advances the GBC gradient."""
+    index = 0
+    while index < len(text):
+        if text[index] == "\\" and index + 1 < len(text):
+            escape = text[index + 1]
+            if escape in {"N", "n"}:
+                yield text[index:index + 2], False
+                index += 2
+                continue
+            if escape == "h":
+                yield text[index:index + 2], True
+                index += 2
+                continue
+        yield text[index], True
+        index += 1
+
+
+def _gbc_parts(text: str):
+    """Keep override/drawing spans intact; tokenize only character text."""
+    result = []
+    drawing = False
+    for part in re.split(r"(\{[^}]*\})", text):
+        if not part:
+            continue
+        if part.startswith("{") and part.endswith("}"):
+            # Like libass, only \p changes drawing mode; \r does not reset it.
+            for match in re.finditer(r"\\p(?![A-Za-z])\s*(?:\(\s*)?([+-]?[0-9]+)?", part):
+                drawing = int(match.group(1) or "0") > 0
+            result.append((part, None))
+        elif drawing:
+            result.append((part, None))
+        else:
+            result.append((part, list(_iter_gbc_text_tokens(part))))
+    return result
+
 def _generate_gbc(
     event: ASSEvent,
     style: Optional[ASSStyle],
     settings: GradientSettings,
     enabled_tags: dict[str, TagGradientConfig],
     base_bounds_meta: Optional[str] = None,
+    ass_file: Optional[ASSFile] = None,
 ) -> list[ASSEvent]:
     """Generate per-character gradient."""
     # GBC also supports sampling!
@@ -890,7 +883,7 @@ def _generate_gbc(
                 clips.pop(tag, None)
     sampling_data: dict[str, ChannelSamplingData] = {}
     
-    if clips and settings.video_path:
+    if clips:
         for tag_name in enabled_tags:
             if tag_name not in _COLOR_TAGS:
                 continue
@@ -929,37 +922,43 @@ def _generate_gbc(
                 )
 
     parsed = parse_tags_from_text(clean_text)
+    implicit_pos = implicit_static_position(event, style, ass_file, parsed, base_bounds_meta)
+    if implicit_pos is not None:
+        parsed["pos"] = implicit_pos
 
-    # Strip override blocks and get plain text
-    plain = strip_tags(clean_text)
-    if not plain:
-        return [event]
-
-    total_chars = len(plain)
+    parts = _gbc_parts(clean_text)
+    total_chars = sum(
+        1
+        for _, tokens in parts
+        if tokens is not None
+        for _, advances in tokens
+        if advances
+    )
     if total_chars == 0:
-        return [event]
-    color_shift_divisor = max(total_chars - 1, 1)
-
-    # Build character list with positions
-    # For GBC, t = char_index / (total_chars - 1)
-    # Build new text with per-character overrides
-    sections = []
-    # Parse the text into tag sections and text sections
-    parts = re.split(r"(\{[^}]*\})", event.text)
+        return [replace(event, text=clean_text)]
 
     char_idx = 0
     new_parts = []
-    for part in parts:
-        if part.startswith("{") and part.endswith("}"):
+    for part, tokens in parts:
+        if tokens is None:
             new_parts.append(part)
         else:
-            for ch in part:
+            for token, advances in tokens:
+                if not advances:
+                    new_parts.append(token)
+                    continue
                 t = char_idx / max(total_chars - 1, 1) if total_chars > 1 else 0.5
-                tag_str = ""
+                override_values = {}
                 for tag_name, cfg in enabled_tags.items():
                     val = None
                     try:
-                        tag_t = _color_shifted_t(t, settings, color_shift_divisor, tag_name)
+                        tag_t = (
+                            _color_shifted_strip_t(
+                                t, settings, char_idx, total_chars,
+                                include_endpoint=True, tag_name=tag_name,
+                            )
+                            if total_chars > 1 else t
+                        )
                         if tag_name in sampling_data:
                             sd = sampling_data[tag_name]
                             sample_t = (
@@ -974,7 +973,7 @@ def _generate_gbc(
                             )
                         else:
                             val = _get_interpolated_value(tag_name, cfg, tag_t, parsed, style, settings)
-                        tag_str += build_tag_string(tag_name, val)
+                        override_values[tag_name] = val
                     except Exception as exc:
                         raise GradientTagError(
                             tag_name,
@@ -983,22 +982,13 @@ def _generate_gbc(
                             position=t,
                             original=exc,
                         ) from exc
-                new_parts.append("{" + tag_str + "}" + ch)
+                tag_str = _serialize_override_values(
+                    resolve_coordinate_overrides(override_values, parsed, style), char_idx, t
+                )
+                new_parts.append("{" + tag_str + "}" + token)
                 char_idx += 1
 
     new_text = "".join(new_parts)
 
-    new_event = ASSEvent(
-        layer=event.layer,
-        start=event.start,
-        end=event.end,
-        style=event.style,
-        name=event.name,
-        margin_l=event.margin_l,
-        margin_r=event.margin_r,
-        margin_v=event.margin_v,
-        effect=event.effect,
-        text=new_text,
-        comment=False,
-    )
+    new_event = replace(event, text=new_text, comment=False)
     return [new_event]

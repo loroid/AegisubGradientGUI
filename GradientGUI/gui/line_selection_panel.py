@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QRect, Qt, Signal
+from PySide6.QtCore import QEvent, QItemSelectionModel, QRect, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -140,6 +140,12 @@ class _ReferenceLineDelegate(QStyledItemDelegate):
         style.drawControl(QStyle.ControlElement.CE_CheckBox, button, painter)
 
     def editorEvent(self, event, model, option, index) -> bool:
+        if event.type() not in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+        ):
+            return super().editorEvent(event, model, option, index)
         in_reference_area = (
             event.button() == Qt.MouseButton.LeftButton
             and self._reference_rect(option).contains(event.position().toPoint())
@@ -184,7 +190,7 @@ class LineSelectionPanel(QFrame):
 
         self._select_current_btn = QPushButton(tr("仅当前"))
         set_button_text(self._select_current_btn, "仅当前", minimum=70, padding=24)
-        self._select_current_btn.clicked.connect(self.select_current)
+        self._select_current_btn.clicked.connect(lambda: self.select_current())
         header.addWidget(self._select_current_btn)
 
         self._merge_check = QCheckBox(tr("整体范围"))
@@ -228,7 +234,9 @@ class LineSelectionPanel(QFrame):
             if item:
                 item.setData(REFERENCE_ROLE, False)
                 item.setSelected(True)
-        self._list.setCurrentRow(0 if events else -1)
+        self._list.setCurrentRow(
+            0 if events else -1, QItemSelectionModel.SelectionFlag.NoUpdate
+        )
         self._list.blockSignals(False)
 
     def selected_indices(self, active_idx: int, fallback: bool = True) -> list[int]:
@@ -308,7 +316,7 @@ class LineSelectionPanel(QFrame):
             item = self._list.item(idx)
             if item:
                 item.setSelected(True)
-        self._list.setCurrentRow(active_idx)
+        self._list.setCurrentRow(active_idx, QItemSelectionModel.SelectionFlag.NoUpdate)
         self._list.blockSignals(False)
 
     def merge_range_enabled(self) -> bool:

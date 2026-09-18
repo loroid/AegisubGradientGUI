@@ -18,6 +18,8 @@ Polygon = list[Point]
 _TOKEN_RE = re.compile(r"[mnlbspcMNLBSPC]|[-+]?(?:\d+(?:\.\d*)?|\.\d+)")
 _COMMANDS = {"m", "n", "l", "b", "s", "p", "c"}
 _EPS = 1e-6
+_CLIP_SCALE = 7
+_CLIP_FACTOR = 1 << (_CLIP_SCALE - 1)
 
 
 @dataclass(frozen=True)
@@ -162,7 +164,7 @@ def vector_clip_tag_for_strip(
         if len(clipped) >= 3 and abs(_signed_area(clipped)) > 0.1:
             clipped_polygons.append(clipped)
 
-    return _vector_clip_from_polygons(clipped_polygons)
+    return vector_clip_from_polygons(clipped_polygons)
 
 
 def _inverse_vector_clip_tag_for_strip(
@@ -186,7 +188,7 @@ def _inverse_vector_clip_tag_for_strip(
             hole_area += area
 
     if not holes:
-        return _vector_clip_from_polygons([strip_polygon])
+        return vector_clip_from_polygons([strip_polygon])
     if hole_area >= strip_area - 0.1:
         return None
 
@@ -195,7 +197,7 @@ def _inverse_vector_clip_tag_for_strip(
         _with_orientation(hole, positive=False)
         for hole in holes
     ]
-    return _vector_clip_from_polygons(polygons)
+    return vector_clip_from_polygons(polygons)
 
 
 def _parse_rect_clip_content(
@@ -361,7 +363,8 @@ def _line_intersection(p1: Point, p2: Point, q1: Point, q2: Point) -> Point:
     return p1[0] + t * dx1, p1[1] + t * dy1
 
 
-def _vector_clip_from_polygons(polygons: list[Polygon]) -> str | None:
+def vector_clip_from_polygons(polygons: list[Polygon]) -> str | None:
+    """Serialize script-space polygons on a 1/64-pixel vector clip grid."""
     path_parts: list[str] = []
     for polygon in polygons:
         polygon = _clean_polygon(polygon)
@@ -373,8 +376,8 @@ def _vector_clip_from_polygons(polygons: list[Polygon]) -> str | None:
             path_parts.append(f"l {_fmt(x)} {_fmt(y)}")
     if not path_parts:
         return None
-    return r"\clip(1," + " ".join(path_parts) + ")"
+    return f"\\clip({_CLIP_SCALE}," + " ".join(path_parts) + ")"
 
 
 def _fmt(value: float) -> str:
-    return str(int(round(value)))
+    return str(int(round(value * _CLIP_FACTOR)))

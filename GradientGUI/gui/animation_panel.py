@@ -243,6 +243,9 @@ class AnimationPanel(QFrame):
     def active_tag_animation_enabled(self) -> bool:
         return self._enabled.isEnabled() and self._enabled.isChecked()
 
+    def has_active_tag(self) -> bool:
+        return self._active_tag_label is not None
+
     def seam_blend_length(self) -> int:
         return int(self._seam_blend_length.value())
 
@@ -328,9 +331,6 @@ class AnimationPanel(QFrame):
         self._on_settings_changed()
 
     def _update_settings_enabled(self) -> None:
-        for widget in (
-            self._use_transform,
-            self._frame_step,
-            self._seam_blend_length,
-        ):
-            widget.setEnabled(True)
+        self._use_transform.setEnabled(True)
+        self._frame_step.setEnabled(self.has_active_tag())
+        self._seam_blend_length.setEnabled(self.has_active_tag())

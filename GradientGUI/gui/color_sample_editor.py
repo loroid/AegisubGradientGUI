@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Optional
 
 from PySide6.QtCore import Qt
@@ -20,7 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QColorDialog,
 )
-from gui.i18n import tr
+from gui.i18n import is_english, tr
 
 
 def bgr_to_qcolor(bgr: str) -> QColor:
@@ -71,6 +72,7 @@ class ColorSampleEditorDialog(QDialog):
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self._table, stretch=1)
 
         controls = QHBoxLayout()
@@ -114,42 +116,54 @@ class ColorSampleEditorDialog(QDialog):
         return self._action
 
     def stops(self) -> list[tuple[float, str]]:
-        self._read_table()
-        return self._normalize_stops(self._stops)
+        return list(self._stops)
 
     def sampled_colors(self) -> list[tuple[int, str]]:
-        self._read_table()
         return [
             (idx + 1, color)
-            for idx, (_pos, color) in enumerate(self._normalize_stops(self._stops))
+            for idx, (_pos, color) in enumerate(self._stops)
         ]
 
     def accept(self) -> None:
         self._accept_confirm()
 
     def _accept_confirm(self):
-        self._read_table()
+        stops = self._validated_table()
+        if stops is None:
+            return
+        self._stops = self._normalize_stops(stops)
         self._action = "confirm"
         super().accept()
 
     def _accept_as_curve(self):
-        self._read_table()
-        if len(self._stops) < 2:
+        stops = self._validated_table()
+        if stops is None:
+            return
+        if len(stops) < 2:
             QMessageBox.warning(self, tr("采色结果不足"), tr("至少需要两个颜色点。"))
             return
+        if len({pos for pos, _ in stops}) != len(stops):
+            QMessageBox.warning(self, tr("错误"), tr("转换为曲线时，颜色点的位置不能重复。"))
+            return
+        self._stops = self._normalize_stops(stops)
         self._action = "apply_curve"
         super().accept()
 
     def _reload_table(self) -> None:
-        self._table.setRowCount(0)
-        for pos, color in self._stops:
-            self._append_row(pos, color)
+        previous = self._table.blockSignals(True)
+        try:
+            self._table.setRowCount(0)
+            for pos, color in self._stops:
+                self._append_row(pos, color)
+            self._table.resizeColumnToContents(0)
+        finally:
+            self._table.blockSignals(previous)
 
     def _append_row(self, pos: float, color: str) -> None:
         row = self._table.rowCount()
         self._table.insertRow(row)
 
-        pos_item = QTableWidgetItem(f"{max(0.0, min(1.0, pos)):.6f}")
+        pos_item = QTableWidgetItem(repr(float(pos)))
         pos_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self._table.setItem(row, 0, pos_item)
 
@@ -163,75 +177,110 @@ class ColorSampleEditorDialog(QDialog):
         self._set_button_color(btn, color)
         self._table.setCellWidget(row, 2, btn)
 
-    def _read_table(self) -> None:
+    def _read_table(self, *, excluded_rows: Optional[set[int]] = None) -> list[tuple[float, str]]:
         stops: list[tuple[float, str]] = []
         for row in range(self._table.rowCount()):
+            if excluded_rows and row in excluded_rows:
+                continue
             pos_item = self._table.item(row, 0)
             color_item = self._table.item(row, 1)
-            if not pos_item or not color_item:
-                continue
             try:
-                pos = float(pos_item.text())
+                pos = float(pos_item.text() if pos_item else "")
+                if not math.isfinite(pos) or not 0.0 <= pos <= 1.0:
+                    raise ValueError
             except ValueError:
-                pos = 0.0
-            color = color_item.text().strip().upper()[:6]
-            if len(color) == 6:
-                stops.append((pos, color))
-        self._stops = self._normalize_stops(stops)
+                message = (f"Row {row + 1} position must be a finite number from 0 to 1."
+                           if is_english() else f"第 {row + 1} 行位置必须是 0 到 1 之间的有限数值。")
+                raise ValueError(message) from None
+            color = _valid_bgr(color_item.text() if color_item else "")
+            if color is None:
+                message = (f"Row {row + 1} BGR color must be 6 hex digits."
+                           if is_english() else f"第 {row + 1} 行 BGR 颜色应为 6 位十六进制。")
+                raise ValueError(message)
+            stops.append((pos, color))
+        return stops
+
+    def _validated_table(self, *, excluded_rows: Optional[set[int]] = None) -> Optional[list[tuple[float, str]]]:
+        try:
+            return self._read_table(excluded_rows=excluded_rows)
+        except ValueError as error:
+            QMessageBox.warning(self, tr("错误"), str(error))
+            return None
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 1:
+            return
+        color = _valid_bgr(item.text())
+        button = self._table.cellWidget(item.row(), 2)
+        if color is not None and isinstance(button, QPushButton):
+            self._set_button_color(button, color)
 
     def _delete_selected(self) -> None:
         rows = sorted({idx.row() for idx in self._table.selectedIndexes()}, reverse=True)
         if not rows:
             return
+        stops = self._validated_table(excluded_rows=set(rows))
+        if stops is None:
+            return
         if self._table.rowCount() - len(rows) < 2:
             QMessageBox.warning(self, tr("采色结果不足"), tr("至少保留两个颜色点。"))
             return
-        for row in rows:
-            self._table.removeRow(row)
-        self._read_table()
+        self._stops = self._normalize_stops(stops)
         self._reload_table()
 
     def _insert_after_selected(self) -> None:
-        self._read_table()
+        rows = self._validated_table()
+        if rows is None:
+            return
         selected_rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
-        insert_at = (selected_rows[-1] + 1) if selected_rows else len(self._stops)
-        insert_at = max(0, min(insert_at, len(self._stops)))
+        order = sorted(range(len(rows)), key=lambda index: rows[index][0])
+        insert_at = order.index(selected_rows[-1]) + 1 if selected_rows else len(rows)
+        stops = [rows[index] for index in order]
 
-        if not self._stops:
+        if not stops:
             pos = 0.0
             color = "FFFFFF"
         elif insert_at <= 0:
-            pos = self._stops[0][0] / 2.0
-            color = self._stops[0][1]
-        elif insert_at >= len(self._stops):
-            pos = (self._stops[-1][0] + 1.0) / 2.0
-            color = self._stops[-1][1]
+            pos = stops[0][0] / 2.0
+            color = stops[0][1]
+        elif insert_at >= len(stops):
+            pos = (stops[-1][0] + 1.0) / 2.0
+            color = stops[-1][1]
+            if stops[-1][0] == 1.0:
+                # Leave room for an appended endpoint instead of creating a
+                # duplicate position that disappears during curve conversion.
+                previous = stops[-2][0] if len(stops) > 1 else 0.0
+                stops[-1] = ((previous + 1.0) / 2.0, color)
         else:
-            prev_pos, prev_color = self._stops[insert_at - 1]
-            next_pos, _next_color = self._stops[insert_at]
+            prev_pos, prev_color = stops[insert_at - 1]
+            next_pos, _next_color = stops[insert_at]
             pos = (prev_pos + next_pos) / 2.0
             color = prev_color
 
-        self._stops.insert(insert_at, (max(0.0, min(1.0, pos)), color))
+        stops.insert(insert_at, (pos, color))
+        self._stops = stops
         self._reload_table()
         self._table.selectRow(insert_at)
 
     def _merge_similar(self) -> None:
-        self._read_table()
-        if len(self._stops) <= 2:
+        stops = self._validated_table()
+        if stops is None or len(stops) <= 2:
             return
+        stops = self._normalize_stops(stops)
         threshold = float(self._threshold.value())
-        merged = [self._stops[0]]
-        for stop in self._stops[1:-1]:
+        merged = [stops[0]]
+        for stop in stops[1:-1]:
             if _color_distance(merged[-1][1], stop[1]) > threshold:
                 merged.append(stop)
-        merged.append(self._stops[-1])
+        merged.append(stops[-1])
         self._stops = merged
         self._reload_table()
 
     def _reverse(self) -> None:
-        self._read_table()
-        self._stops = [(1.0 - pos, color) for pos, color in reversed(self._stops)]
+        stops = self._validated_table()
+        if stops is None:
+            return
+        self._stops = [(1.0 - pos, color) for pos, color in reversed(self._normalize_stops(stops))]
         self._reload_table()
 
     def _edit_color(self, row: int) -> None:
@@ -302,3 +351,8 @@ def _color_distance(a: str, b: str) -> float:
         + (ca.green() - cb.green()) ** 2
         + (ca.blue() - cb.blue()) ** 2
     )
+
+
+def _valid_bgr(text: str) -> Optional[str]:
+    value = text.strip().upper().removeprefix("#")
+    return value if re.fullmatch(r"[0-9A-F]{6}", value) else None

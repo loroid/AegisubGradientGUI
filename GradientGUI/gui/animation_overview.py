@@ -329,6 +329,8 @@ class _AnimationOverviewCanvas(QWidget):
         painter.setPen(QPen(QColor("#ffe0a3"), 1))
         painter.setBrush(QColor("#ffb84d"))
         for node in nodes:
+            if not 0 <= node.x <= self._x_max:
+                continue
             x = self._x_to_pixel(node.x, rect)
             y = self._value_to_y(node.y, rect, y_min, y_max)
             painter.drawEllipse(QRectF(x - 4, y - 4, 8, 8))

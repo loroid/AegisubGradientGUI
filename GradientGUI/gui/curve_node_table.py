@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import math
+import re
 from typing import Optional
 
 from PySide6.QtCore import Qt
@@ -44,6 +47,7 @@ class CurveNodeTableDialog(QDialog):
         x_max: float = 100.0,
         integer_x: bool = False,
         integer_y: bool = False,
+        pin_endpoints_to_range: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -55,6 +59,7 @@ class CurveNodeTableDialog(QDialog):
         self._x_max = max(1.0, float(x_max or 100.0))
         self._integer_x = bool(integer_x)
         self._integer_y = bool(integer_y)
+        self._pin_endpoints_to_range = bool(pin_endpoints_to_range)
         self._nodes = [_clone_node(node) for node in nodes]
 
         layout = QVBoxLayout(self)
@@ -128,8 +133,9 @@ class CurveNodeTableDialog(QDialog):
             QMessageBox.warning(self, tr("节点不足"), tr("至少需要两个控制点。"))
             return
         nodes.sort(key=lambda node: node.x)
-        nodes[0].x = 0.0
-        nodes[-1].x = self._x_max
+        if self._pin_endpoints_to_range:
+            nodes[0].x = 0.0
+            nodes[-1].x = self._x_max
         self._nodes = nodes
         super().accept()
 
@@ -200,6 +206,8 @@ class CurveNodeTableDialog(QDialog):
             ]
         for col, value in enumerate(values):
             cell = QTableWidgetItem(str(value))
+            if col == 0:
+                cell.setData(Qt.ItemDataRole.UserRole, _clone_node(node))
             cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self._table.setItem(row, col, cell)
 
@@ -278,7 +286,7 @@ class CurveNodeTableDialog(QDialog):
             if not x_text:
                 continue
             try:
-                x = max(0.0, min(self._x_max, float(x_text)))
+                x = max(0.0, min(self._x_max, _finite_float(x_text)))
             except ValueError as exc:
                 if is_english():
                     raise ValueError(f"Row {row + 1} position is not a number.") from exc
@@ -286,22 +294,26 @@ class CurveNodeTableDialog(QDialog):
             if self._integer_x:
                 x = float(round(x))
             mode = _parse_mode(_cell_text(self._table, row, self._table.columnCount() - 1))
+            # Preserve fields that are not exposed by this table's column set.
+            saved = self._table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            node = _clone_node(saved) if isinstance(saved, CurveNode) else CurveNode(x=x)
+            node.x = x
             if self._is_color:
-                value = _cell_text(self._table, row, 1).upper().replace("#", "")
-                if len(value) != 6:
+                value = _cell_text(self._table, row, 1).upper().removeprefix("#")
+                if not re.fullmatch(r"[0-9A-F]{6}", value):
                     if is_english():
                         raise ValueError(f"Row {row + 1} BGR color must be 6 hex digits.")
                     raise ValueError(f"第 {row + 1} 行 BGR 颜色应为 6 位十六进制。")
-                node = CurveNode(x=x, y=0.0, value_str=value)
+                node.value_str = value
             elif self._is_text:
-                node = CurveNode(x=x, y=0.0, value_str=_cell_text(self._table, row, 1))
+                node.value_str = _cell_text(self._table, row, 1)
             else:
                 try:
-                    y = float(_cell_text(self._table, row, 1) or "0")
-                    hix = float(_cell_text(self._table, row, 2) or str(x - 10))
-                    hiy = float(_cell_text(self._table, row, 3) or str(y))
-                    hox = float(_cell_text(self._table, row, 4) or str(x + 10))
-                    hoy = float(_cell_text(self._table, row, 5) or str(y))
+                    y = _finite_float(_cell_text(self._table, row, 1) or "0")
+                    hix = _finite_float(_cell_text(self._table, row, 2) or str(x - 10))
+                    hiy = _finite_float(_cell_text(self._table, row, 3) or str(y))
+                    hox = _finite_float(_cell_text(self._table, row, 4) or str(x + 10))
+                    hoy = _finite_float(_cell_text(self._table, row, 5) or str(y))
                 except ValueError as exc:
                     if is_english():
                         raise ValueError(f"Row {row + 1} contains an invalid number.") from exc
@@ -311,32 +323,22 @@ class CurveNodeTableDialog(QDialog):
                     hiy = float(round(hiy))
                     hoy = float(round(hoy))
                 if self._integer_x:
-                    hix = float(round(hix))
-                    hox = float(round(hox))
-                node = CurveNode(
-                    x=x,
-                    y=y,
-                    handle_in_x=hix,
-                    handle_in_y=hiy,
-                    handle_out_x=hox,
-                    handle_out_y=hoy,
-                )
+                    if self._pin_endpoints_to_range or hix != node.handle_in_x:
+                        hix = float(round(hix))
+                    if self._pin_endpoints_to_range or hox != node.handle_out_x:
+                        hox = float(round(hox))
+                node.y = y
+                node.handle_in_x = hix
+                node.handle_in_y = hiy
+                node.handle_out_x = hox
+                node.handle_out_y = hoy
             node.segment_mode = mode
             nodes.append(node)
         return nodes
 
 
 def _clone_node(node: CurveNode) -> CurveNode:
-    return CurveNode(
-        x=node.x,
-        y=node.y,
-        value_str=node.value_str,
-        handle_in_x=node.handle_in_x,
-        handle_in_y=node.handle_in_y,
-        handle_out_x=node.handle_out_x,
-        handle_out_y=node.handle_out_y,
-        segment_mode=node.segment_mode,
-    )
+    return copy.copy(node)
 
 
 def _parse_mode(text: str) -> Optional[InterpolationMode]:
@@ -365,4 +367,11 @@ def _cell_text(table: QTableWidget, row: int, col: int) -> str:
 def _fmt_float(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
-    return f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return repr(float(value))
+
+
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("Expected a finite number.")
+    return value

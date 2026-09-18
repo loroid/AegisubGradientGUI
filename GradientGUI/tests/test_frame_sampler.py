@@ -19,6 +19,26 @@ from gui.dependency_health import HealthItem, _check_video_frame, run_startup_he
 
 
 class FrameSamplerTest(unittest.TestCase):
+    def test_nearby_times_do_not_reuse_the_wrong_frame(self) -> None:
+        sampler = FrameSampler("ffmpeg.exe")
+
+        def fake_run(cmd, **_kwargs):
+            time_sec = float(cmd[cmd.index("-ss") + 1])
+            color = (255, 0, 0) if time_sec < 0.005 else (0, 0, 255)
+            Image.new("RGB", (2, 2), color).save(Path(cmd[-1]))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("engine.frame_sampler.tempfile.gettempdir", return_value=temp_dir):
+                with patch("engine.frame_sampler.subprocess.run", side_effect=fake_run) as run:
+                    self.assertTrue(sampler.load_frame("video.mp4", 0.0))
+                    self.assertTrue(sampler.load_frame("video.mp4", 0.005))
+                    self.assertEqual(sampler.frame_cache_key(), ("time", "video.mp4", 0.005))
+                    self.assertEqual(sampler.get_pixel_bgr(0, 0), "FF0000")
+                    self.assertTrue(sampler.load_frame("video.mp4", 0.0))
+                    self.assertEqual(sampler.get_pixel_bgr(0, 0), "0000FF")
+                    self.assertEqual(run.call_count, 2)
+
     def test_successful_frame_number_load_reads_and_removes_temp_file(self) -> None:
         sampler = FrameSampler("ffmpeg.exe")
 

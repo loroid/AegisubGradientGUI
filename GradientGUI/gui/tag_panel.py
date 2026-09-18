@@ -6,6 +6,8 @@ Entire row is clickable to select as active curve.
 """
 
 from __future__ import annotations
+
+import copy
 from typing import Optional
 
 from PySide6.QtWidgets import (
@@ -16,7 +18,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QRectF, QSize, QTimer
 from PySide6.QtGui import QColor, QPixmap, QIcon, QGuiApplication, QPainter, QPen, QBrush
 
-from engine.tag_parser import TAG_INFO
+from engine.tag_parser import TAG_INFO, GUI_TAGS, COORD_AXIS_TAGS
 from engine.models import TagGradientConfig, ColorSpace
 from gui.i18n import group_label, set_button_text, tag_label, tr
 
@@ -239,7 +241,7 @@ class ScreenColorPicker(QWidget):
 
 class ValueInput(QWidget):
     """A widget for inputting a single value based on tag type."""
-    changed = Signal()
+    changed = Signal(str)
     preview_color_changed = Signal(str)
     preview_color_cancelled = Signal()
 
@@ -271,7 +273,7 @@ class ValueInput(QWidget):
             self._spin = QSpinBox()
             self._spin.setRange(0, 255)
             self._spin.setFixedWidth(50)
-            self._spin.valueChanged.connect(lambda: self.changed.emit())
+            self._spin.valueChanged.connect(lambda: self.changed.emit(""))
             layout.addWidget(self._spin)
         elif tag_type == "coord":
             self._cx = QDoubleSpinBox()
@@ -280,14 +282,14 @@ class ValueInput(QWidget):
             self._cy = QDoubleSpinBox()
             self._cy.setRange(-9999, 9999)
             self._cy.setFixedWidth(65)
-            self._cx.valueChanged.connect(lambda: self.changed.emit())
-            self._cy.valueChanged.connect(lambda: self.changed.emit())
+            self._cx.valueChanged.connect(lambda: self.changed.emit("x"))
+            self._cy.valueChanged.connect(lambda: self.changed.emit("y"))
             layout.addWidget(self._cx)
             layout.addWidget(self._cy)
         elif tag_type == "text":
             self._text = QLineEdit()
             self._text.setFixedWidth(130)
-            self._text.textChanged.connect(lambda: self.changed.emit())
+            self._text.textChanged.connect(lambda: self.changed.emit(""))
             layout.addWidget(self._text)
         else:
             tag_info = TAG_INFO.get(self.tag, {})
@@ -297,8 +299,8 @@ class ValueInput(QWidget):
             if "input_step" in tag_info:
                 self._spin.setSingleStep(float(tag_info["input_step"]))
             wide_numeric_tags = {"fscx", "fscy", "fs", "fax", "fay"}
-            self._spin.setFixedWidth(88 if self.tag in wide_numeric_tags else 72)
-            self._spin.valueChanged.connect(lambda: self.changed.emit())
+            self._spin.setFixedWidth(65 if self.tag in COORD_AXIS_TAGS else 88 if self.tag in wide_numeric_tags else 72)
+            self._spin.valueChanged.connect(lambda: self.changed.emit(""))
             layout.addWidget(self._spin)
 
     def value(self):
@@ -393,7 +395,7 @@ class ValueInput(QWidget):
     def _set_color(self, color: QColor):
         self._val = _qcolor_to_bgr(color)
         self._update_btn()
-        self.changed.emit()
+        self.changed.emit("")
 
     def _preview_color(self, color: QColor):
         if color.isValid():
@@ -422,7 +424,8 @@ class ValueInput(QWidget):
 
 
 class TagRowWidget(QFrame):
-    changed = Signal(str)
+    # A negative input index identifies a non-value change (toggle/smoothing).
+    changed = Signal(str, int, str)
     selected = Signal(str)
     path_requested = Signal(str)
     preview_color_changed = Signal(str, int, str)
@@ -488,7 +491,7 @@ class TagRowWidget(QFrame):
             self._path_smooth_strength.setValue(1.0)
             self._path_smooth_strength.setFixedWidth(58)
             self._path_smooth_strength.setToolTip(tr("路径采色平滑力度：0=原色阶梯，1=完全平滑"))
-            self._path_smooth_strength.valueChanged.connect(lambda _value=0.0: self.changed.emit(self.tag))
+            self._path_smooth_strength.valueChanged.connect(lambda _value=0.0: self.changed.emit(self.tag, -1, ""))
             self._path_smooth_strength.setEnabled(False)
             layout.addWidget(self._path_smooth_strength)
 
@@ -536,7 +539,7 @@ class TagRowWidget(QFrame):
         self._config.enabled = checked
         if checked:
             self.selected.emit(self.tag)
-        self.changed.emit(self.tag)
+        self.changed.emit(self.tag, -1, "")
 
     def set_enabled_checked(self, checked: bool):
         self._config.enabled = bool(checked)
@@ -593,16 +596,16 @@ class TagRowWidget(QFrame):
     def _on_path_smooth_toggled(self, checked: bool):
         if self._path_smooth_strength:
             self._path_smooth_strength.setEnabled(bool(checked))
-        self.changed.emit(self.tag)
+        self.changed.emit(self.tag, -1, "")
 
-    def _on_val_changed(self):
+    def _on_val_changed(self, input_index: int, axis: str):
         if not self._syncing:
-            self.changed.emit(self.tag)
+            self.changed.emit(self.tag, input_index, axis)
             
     def _add_input_widget(self):
         input_index = len(self._inputs)
         inp = ValueInput(self.tag_type, self.tag)
-        inp.changed.connect(self._on_val_changed)
+        inp.changed.connect(lambda axis, index=input_index: self._on_val_changed(index, axis))
         inp.preview_color_changed.connect(
             lambda value, index=input_index: self.preview_color_changed.emit(
                 self.tag, index, value
@@ -630,47 +633,39 @@ class TagRowWidget(QFrame):
             self._inputs[-1].set_value(val)
 
     def get_config(self) -> TagGradientConfig:
+        from engine.interpolation import make_default_nodes
+
+        config = copy.deepcopy(self._config)
         v_start = self._inputs[0].value()
         v_end = self._inputs[1].value()
 
         if self.tag_type == "coord":
             sx, sy = v_start if isinstance(v_start, tuple) else (0.0, 0.0)
             ex, ey = v_end if isinstance(v_end, tuple) else (sx, sy)
-            from engine.interpolation import make_default_nodes
-            if not self._config.nodes or len(self._config.nodes) < 2:
-                self._config.nodes = make_default_nodes(start_y=float(sx), end_y=float(ex))
+            if len(config.nodes) < 2:
+                config.nodes = make_default_nodes(start_y=float(sx), end_y=float(ex))
             else:
-                self._config.nodes[0].y = float(sx)
-                self._config.nodes[-1].y = float(ex)
-            if not self._config.coord_y_nodes or len(self._config.coord_y_nodes) < 2:
-                self._config.coord_y_nodes = make_default_nodes(start_y=float(sy), end_y=float(ey))
+                config.nodes[0].y = float(sx)
+                config.nodes[-1].y = float(ex)
+            if len(config.coord_y_nodes) < 2:
+                config.coord_y_nodes = make_default_nodes(start_y=float(sy), end_y=float(ey))
             else:
-                self._config.coord_y_nodes[0].y = float(sy)
-                self._config.coord_y_nodes[-1].y = float(ey)
-            return self._config
+                config.coord_y_nodes[0].y = float(sy)
+                config.coord_y_nodes[-1].y = float(ey)
+            return config
 
-        if self.tag_type == "text":
-            if not self._config.nodes or len(self._config.nodes) < 2:
-                from engine.interpolation import make_default_nodes
-                self._config.nodes = make_default_nodes(start_y=0.0, end_y=0.0)
-            self._config.nodes[0].value_str = str(v_start)
-            self._config.nodes[-1].value_str = str(v_end)
-            return self._config
-
-        if not self._config.nodes:
-            from engine.interpolation import make_default_nodes
-            if self.tag_type == "color":
-                self._config.nodes = make_default_nodes(start_color=str(v_start), end_color=str(v_end))
+        if len(config.nodes) < 2:
+            if self.tag_type in {"color", "text"}:
+                config.nodes = make_default_nodes(start_y=0, end_y=0, start_color=str(v_start), end_color=str(v_end))
             else:
-                self._config.nodes = make_default_nodes(start_y=float(v_start), end_y=float(v_end))
+                config.nodes = make_default_nodes(start_y=float(v_start), end_y=float(v_end))
+        elif self.tag_type in {"color", "text"}:
+            config.nodes[0].value_str = str(v_start)
+            config.nodes[-1].value_str = str(v_end)
         else:
-            if self.tag_type == "color":
-                self._config.nodes[0].value_str = str(v_start)
-                self._config.nodes[-1].value_str = str(v_end)
-            else:
-                self._config.nodes[0].y = float(v_start)
-                self._config.nodes[-1].y = float(v_end)
-        return self._config
+            config.nodes[0].y = float(v_start)
+            config.nodes[-1].y = float(v_end)
+        return config
 
     def set_config(self, cfg: TagGradientConfig):
         self._syncing = True
@@ -724,7 +719,7 @@ class TagRowWidget(QFrame):
 
 
 class TagPanel(QWidget):
-    tag_changed = Signal(str)
+    tag_changed = Signal(str, int, str)
     tag_selected = Signal(str)
     path_sample_requested = Signal(str)
     preview_color_changed = Signal(str, int, str)
@@ -747,7 +742,7 @@ class TagPanel(QWidget):
         self._cs_combo = QComboBox()
         self._cs_combo.addItems(["RGB", "HSL", "OKLab"])
         self._cs_combo.setFixedWidth(80)
-        self._cs_combo.currentTextChanged.connect(lambda: self.tag_changed.emit(""))
+        self._cs_combo.currentTextChanged.connect(lambda: self.tag_changed.emit("", -1, ""))
         cs_layout.addWidget(self._cs_combo)
         cs_layout.addStretch()
 
@@ -762,7 +757,8 @@ class TagPanel(QWidget):
 
         self._rows: dict[str, TagRowWidget] = {}
         groups = {}
-        for tag, info in TAG_INFO.items():
+        for tag in GUI_TAGS:
+            info = TAG_INFO[tag]
             g = info.get("group", "Other")
             groups.setdefault(g, []).append(tag)
 
@@ -860,11 +856,16 @@ class TagPanel(QWidget):
                 row.set_path_smooth_strength(strength_map.get(tag, 1.0))
 
     def get_enabled_tags(self) -> list[str]:
-        return [tag for tag, row in self._rows.items() if row.get_config().enabled]
+        return [tag for tag, row in self._rows.items() if row._check.isChecked()]
 
-    def set_defaults_from_parsed(self, parsed_tags: dict, style=None):
+    def set_defaults_from_parsed(
+        self, parsed_tags: dict, style=None, *, preserve_tags: Optional[set[str]] = None,
+    ):
         from engine.tag_parser import get_tag_value
+        preserve_tags = set(preserve_tags or ())
         for tag, row in self._rows.items():
+            if row._check.isChecked() or tag in preserve_tags:
+                continue
             val = get_tag_value(tag, parsed_tags, style)
             row.set_start_value(val)
             row.set_end_value(val)

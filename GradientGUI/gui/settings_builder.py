@@ -15,8 +15,9 @@ from engine.path_model import (
     export_line_sampling_frames,
     export_line_sampling_paths,
     export_line_sampling_samples,
+    normalize_line_path_state,
 )
-from engine.tag_parser import TAG_INFO
+from engine.tag_parser import TAG_INFO, extract_clip_tags
 from gui.bounds_controller import BoundsController, BoundsRect
 from gui.curve_keys import curve_key
 
@@ -58,14 +59,33 @@ def current_video_time(
     return time_to_seconds(evt.start)
 
 
+def initial_sampling_paths(events: list[ASSEvent]) -> dict[int, dict[str, PathSet]]:
+    state = {}
+    for idx, event in enumerate(events):
+        _, clips = extract_clip_tags(event.text)
+        if clips:
+            state[idx] = {tag: PathSet.from_ass_path(path) for tag, path in clips.items()}
+    return state
+
+
+def _sampling_state_for_event(
+    sampling_paths: dict[int, dict[str, PathSet]],
+    active_event_idx: int,
+    idx: int,
+) -> dict[str, PathSet]:
+    # Override whole path states so missing local metadata cannot leak in
+    # from the active line's unrelated path.
+    state = normalize_line_path_state(sampling_paths.get(active_event_idx, {}))
+    state.update(normalize_line_path_state(sampling_paths.get(idx, {})))
+    return state
+
+
 def sampling_paths_for_event(
     sampling_paths: dict[int, dict[str, PathSet]],
     active_event_idx: int,
     idx: int,
 ) -> dict[str, str]:
-    paths = export_line_sampling_paths(sampling_paths.get(active_event_idx, {}))
-    paths.update(export_line_sampling_paths(sampling_paths.get(idx, {})))
-    return paths
+    return export_line_sampling_paths(_sampling_state_for_event(sampling_paths, active_event_idx, idx))
 
 
 def sampling_frames_for_event(
@@ -73,9 +93,7 @@ def sampling_frames_for_event(
     active_event_idx: int,
     idx: int,
 ) -> dict[str, int]:
-    frames = export_line_sampling_frames(sampling_paths.get(active_event_idx, {}))
-    frames.update(export_line_sampling_frames(sampling_paths.get(idx, {})))
-    return frames
+    return export_line_sampling_frames(_sampling_state_for_event(sampling_paths, active_event_idx, idx))
 
 
 def sampling_samples_for_event(
@@ -83,9 +101,7 @@ def sampling_samples_for_event(
     active_event_idx: int,
     idx: int,
 ) -> dict[str, dict[str, object]]:
-    samples = export_line_sampling_samples(sampling_paths.get(active_event_idx, {}))
-    samples.update(export_line_sampling_samples(sampling_paths.get(idx, {})))
-    return samples
+    return export_line_sampling_samples(_sampling_state_for_event(sampling_paths, active_event_idx, idx))
 
 
 def build_base_settings(
@@ -139,7 +155,7 @@ def build_base_settings(
         for tag in ("1c", "2c", "3c", "4c")
     }
     if animation_settings is not None:
-        settings.animation = animation_settings
+        settings.animation = copy.deepcopy(animation_settings)
 
     configs = tag_panel.get_all_configs()
     for tag, config in configs.items():
@@ -147,16 +163,16 @@ def build_base_settings(
             x_key = curve_key(tag, "x")
             y_key = curve_key(tag, "y")
             if x_key in tag_curves:
-                config.nodes = tag_curves[x_key]
+                config.nodes = copy.deepcopy(tag_curves[x_key])
             if y_key in tag_curves:
-                config.coord_y_nodes = tag_curves[y_key]
+                config.coord_y_nodes = copy.deepcopy(tag_curves[y_key])
             if x_key in tag_modes:
                 config.mode = tag_modes[x_key]
             if y_key in tag_modes:
                 config.coord_y_mode = tag_modes[y_key]
         else:
             if tag in tag_curves:
-                config.nodes = tag_curves[tag]
+                config.nodes = copy.deepcopy(tag_curves[tag])
             if tag in tag_modes:
                 config.mode = tag_modes[tag]
         settings.tags[tag] = config

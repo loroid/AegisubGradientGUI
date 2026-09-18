@@ -8,6 +8,7 @@ from typing import Any
 
 from PySide6.QtWidgets import QFileDialog
 
+from engine.file_io import atomic_text_writer
 from gui.i18n import tr
 
 
@@ -31,7 +32,7 @@ def select_save_path(parent, default_path: str) -> str:
 
 
 def write_preset(path: str, preset_data: dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    with atomic_text_writer(path) as f:
         json.dump(preset_data, f, ensure_ascii=False, indent=2)
 
 
@@ -82,7 +83,7 @@ def remember_recent_preset(path: str) -> None:
     recent.insert(0, path)
     recent = recent[:MAX_RECENT_PRESETS]
     try:
-        with open(RECENT_PRESETS_PATH, "w", encoding="utf-8") as f:
+        with atomic_text_writer(RECENT_PRESETS_PATH) as f:
             json.dump(recent, f, ensure_ascii=False, indent=2)
     except Exception:
         pass

@@ -27,6 +27,8 @@ NUMERIC_TAGS = (
     "blur", "be",
 )
 COORD_TAGS = ("pos", "org", "fad")
+COORD_AXIS_TAGS = {f"{tag}:{axis}": (tag, index)
+                   for tag in ("pos", "org") for index, axis in enumerate(("x", "y"))}
 TEXT_TAGS = ("fn",)
 
 ALL_GRADIENT_TAGS = COLOR_TAGS + ALPHA_TAGS + NUMERIC_TAGS + COORD_TAGS + TEXT_TAGS
@@ -73,6 +75,14 @@ TAG_INFO = {
     "pos":   {"type": "coord",   "label": "\\pos  位置",     "group": "Position", "default": (0.0, 0.0)},
     "org":   {"type": "coord",   "label": "\\org  旋转原点",  "group": "Position", "default": (0.0, 0.0)},
 }
+
+for _axis_tag, (_coordinate_tag, _axis_index) in COORD_AXIS_TAGS.items():
+    TAG_INFO[_axis_tag] = {
+        "type": "numeric", "label": f"\\{_coordinate_tag} {'XY'[_axis_index]}",
+        "group": "Position", "default": 0.0,
+    }
+
+GUI_TAGS = tuple(tag for tag in TAG_INFO if tag not in {"pos", "org"})
 
 
 # ── Parse tags from dialogue text ─────────────────────────────────────────────
@@ -191,9 +201,43 @@ def get_default_from_style(tag: str, style: Optional[ASSStyle]) -> object:
 
 def get_tag_value(tag: str, parsed_tags: dict, style: Optional[ASSStyle]) -> object:
     """Get effective tag value: override if present, else style default."""
+    if tag in COORD_AXIS_TAGS:
+        parent, index = COORD_AXIS_TAGS[tag]
+        return coordinate_base_value(parent, parsed_tags, style)[index]
     if tag in parsed_tags:
         return parsed_tags[tag]
     return get_default_from_style(tag, style)
+
+
+def coordinate_base_value(tag: str, parsed_tags: dict, style: Optional[ASSStyle]) -> tuple:
+    if tag == "org" and tag not in parsed_tags:
+        tag = "pos"
+    return get_tag_value(tag, parsed_tags, style)
+
+
+def resolve_coordinate_overrides(values: dict, parsed_tags: dict, style: Optional[ASSStyle]) -> dict:
+    """Combine independently edited axes into one legal ASS coordinate tag."""
+    if COORD_AXIS_TAGS.keys().isdisjoint(values):
+        return values
+    resolved = {}
+    for tag, value in values.items():
+        if tag in COORD_AXIS_TAGS:
+            parent, _ = COORD_AXIS_TAGS[tag]
+            resolved.setdefault(parent, values.get(parent, coordinate_base_value(parent, parsed_tags, style)))
+        else:
+            resolved[tag] = value
+    for tag, value in values.items():
+        if tag in COORD_AXIS_TAGS:
+            parent, index = COORD_AXIS_TAGS[tag]
+            pair = list(resolved[parent])
+            pair[index] = float(value)
+            resolved[parent] = tuple(pair)
+    return resolved
+
+
+def build_override_tags(values: dict, parsed_tags: dict, style: Optional[ASSStyle]) -> str:
+    return "".join(build_tag_string(tag, value) for tag, value in
+                   resolve_coordinate_overrides(values, parsed_tags, style).items())
 
 
 # ── Extract Clip Paths ────────────────────────────────────────────────────────
@@ -293,6 +337,8 @@ def strip_tags(text: str) -> str:
 
 def remove_specific_tag(text: str, tag: str) -> str:
     """Remove a specific override tag from ASS text."""
+    if tag in COORD_AXIS_TAGS:
+        tag = COORD_AXIS_TAGS[tag][0]
     if tag in COORD_TAGS:
         return re.sub(rf"\\{tag}\([^)]*\)", "", text)
     elif tag in TEXT_TAGS:

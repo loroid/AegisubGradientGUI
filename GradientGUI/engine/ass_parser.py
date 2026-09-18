@@ -8,9 +8,11 @@ Faithfully preserves all sections for consistent rendering.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
+
+from engine.file_io import atomic_text_writer
 
 
 # ── Style field names (V4+ format order) ──────────────────────────────────────
@@ -28,6 +30,19 @@ EVENT_FIELDS = [
     "Layer", "Start", "End", "Style", "Name",
     "MarginL", "MarginR", "MarginV", "Effect", "Text",
 ]
+
+_STYLE_ATTRIBUTES = dict(zip((name.lower() for name in STYLE_FIELDS), (
+    "name", "fontname", "fontsize", "primary_color", "secondary_color",
+    "outline_color", "back_color", "bold", "italic", "underline", "strikeout",
+    "scale_x", "scale_y", "spacing", "angle", "border_style", "outline",
+    "shadow", "alignment", "margin_l", "margin_r", "margin_v", "encoding",
+)))
+_STYLE_FLOAT_ATTRIBUTES = {"fontsize", "scale_x", "scale_y", "spacing", "angle", "outline", "shadow"}
+_EVENT_ATTRIBUTES = dict(zip((name.lower() for name in EVENT_FIELDS), (
+    "layer", "start", "end", "style", "name", "margin_l", "margin_r",
+    "margin_v", "effect", "text",
+)))
+_EVENT_ATTRIBUTES["actor"] = "name"
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -59,42 +74,43 @@ class ASSStyle:
     margin_r: int = 0
     margin_v: int = 0
     encoding: int = 1
+    extra_fields: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    _source_format: str = field(default="", repr=False, compare=False)
 
     @classmethod
-    def from_line(cls, line: str) -> ASSStyle:
+    def from_line(cls, line: str, format_line: str = "") -> ASSStyle:
         """Parse a 'Style: ...' line."""
-        s = cls(raw=line)
+        s = cls(raw=line, _source_format=format_line)
         prefix = "Style:"
         if not line.startswith(prefix):
             return s
-        parts = line[len(prefix):].strip().split(",")
-        if len(parts) < 23:
-            parts.extend([""] * (23 - len(parts)))
-
-        s.name = parts[0].strip()
-        s.fontname = parts[1].strip()
-        s.fontsize = _float(parts[2], 48)
-        s.primary_color = parts[3].strip()
-        s.secondary_color = parts[4].strip()
-        s.outline_color = parts[5].strip()
-        s.back_color = parts[6].strip()
-        s.bold = _int(parts[7])
-        s.italic = _int(parts[8])
-        s.underline = _int(parts[9])
-        s.strikeout = _int(parts[10])
-        s.scale_x = _float(parts[11], 100)
-        s.scale_y = _float(parts[12], 100)
-        s.spacing = _float(parts[13])
-        s.angle = _float(parts[14])
-        s.border_style = _int(parts[15], 1)
-        s.outline = _float(parts[16])
-        s.shadow = _float(parts[17])
-        s.alignment = _int(parts[18], 2)
-        s.margin_l = _int(parts[19])
-        s.margin_r = _int(parts[20])
-        s.margin_v = _int(parts[21])
-        s.encoding = _int(parts[22], 1)
+        values = _record_values(line[len(prefix):], format_line, STYLE_FIELDS)
+        for name, value in values.items():
+            attribute = _STYLE_ATTRIBUTES.get(name)
+            if attribute is None:
+                s.extra_fields += ((name, value),)
+                continue
+            default = getattr(s, attribute)
+            if attribute in _STYLE_FLOAT_ATTRIBUTES:
+                value = _float(value, default)
+            elif isinstance(default, int):
+                value = _int(value, default)
+            else:
+                value = value.strip()
+            setattr(s, attribute, value)
         return s
+
+    def to_ass_line(self, format_line: str = "") -> str:
+        fields = _format_fields(format_line or self._source_format, STYLE_FIELDS)
+        if (
+            self.raw
+            and fields == _format_fields(self._source_format, STYLE_FIELDS)
+            and self == self.from_line(self.raw, self._source_format)
+        ):
+            return self.raw
+        values = dict(self.extra_fields)
+        values.update({name: str(getattr(self, attribute)) for name, attribute in _STYLE_ATTRIBUTES.items()})
+        return "Style: " + ",".join(values.get(name, "") for name in fields)
 
 
 @dataclass
@@ -111,9 +127,10 @@ class ASSEvent:
     effect: str = ""
     text: str = ""
     comment: bool = False
+    extra_fields: tuple[tuple[str, str], ...] = field(default=(), repr=False)
 
     @classmethod
-    def from_line(cls, line: str) -> Optional[ASSEvent]:
+    def from_line(cls, line: str, format_line: str = "") -> Optional[ASSEvent]:
         """Parse a 'Dialogue: ...' or 'Comment: ...' line."""
         is_comment = line.startswith("Comment:")
         is_dialogue = line.startswith("Dialogue:")
@@ -121,33 +138,27 @@ class ASSEvent:
             return None
 
         prefix = "Comment:" if is_comment else "Dialogue:"
-        content = line[len(prefix):].strip()
-        # Split into at most 10 fields (last field Text can contain commas)
-        parts = content.split(",", 9)
-        if len(parts) < 10:
-            parts.extend([""] * (10 - len(parts)))
+        values = _record_values(line[len(prefix):], format_line, EVENT_FIELDS)
+        event = cls(comment=is_comment)
+        for name, value in values.items():
+            attribute = _EVENT_ATTRIBUTES.get(name)
+            if attribute is None:
+                event.extra_fields += ((name, value),)
+            elif attribute == "text":
+                event.text = value
+            elif isinstance(getattr(event, attribute), int):
+                setattr(event, attribute, _int(value))
+            else:
+                setattr(event, attribute, value.strip())
+        return event
 
-        return cls(
-            layer=_int(parts[0]),
-            start=parts[1].strip(),
-            end=parts[2].strip(),
-            style=parts[3].strip(),
-            name=parts[4].strip(),
-            margin_l=_int(parts[5]),
-            margin_r=_int(parts[6]),
-            margin_v=_int(parts[7]),
-            effect=parts[8].strip(),
-            text=parts[9],
-            comment=is_comment,
-        )
-
-    def to_ass_line(self) -> str:
+    def to_ass_line(self, format_line: str = "") -> str:
         """Serialize back to ASS event line."""
         prefix = "Comment" if self.comment else "Dialogue"
-        return (
-            f"{prefix}: {self.layer},{self.start},{self.end},"
-            f"{self.style},{self.name},{self.margin_l},{self.margin_r},"
-            f"{self.margin_v},{self.effect},{self.text}"
+        values = dict(self.extra_fields)
+        values.update({name: str(getattr(self, attribute)) for name, attribute in _EVENT_ATTRIBUTES.items()})
+        return f"{prefix}: " + ",".join(
+            values.get(name, "") for name in _format_fields(format_line, EVENT_FIELDS)
         )
 
 
@@ -161,7 +172,7 @@ class ASSFile:
     styles: list[ASSStyle] = field(default_factory=list)
     events_format: str = ""
     events: list[ASSEvent] = field(default_factory=list)
-    # Preserve unknown sections and raw ordering
+    # Preserve attachment data and other unrecognized sections.
     _raw_sections: list[tuple[str, list[str]]] = field(default_factory=list)
 
     # ── Convenience properties ────────────────────────────────────────────
@@ -176,11 +187,11 @@ class ASSFile:
 
     @property
     def play_res_x(self) -> int:
-        return _int(self.script_info.get("PlayResX", "1920"), 1920)
+        return _int(_case_insensitive_value(self.script_info, "PlayResX", "1920"), 1920)
 
     @property
     def play_res_y(self) -> int:
-        return _int(self.script_info.get("PlayResY", "1080"), 1080)
+        return _int(_case_insensitive_value(self.script_info, "PlayResY", "1080"), 1080)
 
     def get_style(self, name: str) -> Optional[ASSStyle]:
         """Find a style by name."""
@@ -220,7 +231,7 @@ class ASSFile:
 
     def write(self, path: str | Path) -> None:
         """Write the ASS file to disk."""
-        with open(path, "w", encoding="utf-8-sig") as f:
+        with atomic_text_writer(path, encoding="utf-8-sig") as f:
             f.write(self.to_string())
 
     def to_string(self) -> str:
@@ -254,7 +265,7 @@ class ASSFile:
         else:
             lines.append("Format: " + ", ".join(STYLE_FIELDS))
         for s in self.styles:
-            lines.append(s.raw)
+            lines.append(s.to_ass_line(self.styles_format or "Format: " + ", ".join(STYLE_FIELDS)))
         lines.append("")
 
         # [Events]
@@ -264,21 +275,40 @@ class ASSFile:
         else:
             lines.append("Format: " + ", ".join(EVENT_FIELDS))
         for e in self.events:
-            lines.append(e.to_ass_line())
+            lines.append(e.to_ass_line(self.events_format))
         lines.append("")
+
+        for name, raw_lines in self._raw_sections:
+            body = list(raw_lines)
+            while body and body[-1] == "":
+                body.pop()
+            lines.extend([f"[{name}]", *body, ""])
 
         return "\n".join(lines)
 
+    def to_render_string(self, events: list[ASSEvent]) -> str:
+        """Build the same render document for preview and bounds measurement."""
+        info = dict(self.script_info)
+        existing = {key.lower() for key in info}
+        for key, value in (("ScriptType", "v4.00+"), ("PlayResX", str(self.play_res_x)), ("PlayResY", str(self.play_res_y))):
+            if key.lower() not in existing:
+                info[key] = value
+        return replace(
+            self, script_info=info, events=events,
+            project_garbage={}, gradient_metadata={},
+            _raw_sections=[section for section in self._raw_sections if section[0].lower() == "fonts"],
+        ).to_string()
+
     def write_events_only(self, path: str | Path) -> None:
         """Write only the [Events] section (for GUI output)."""
-        with open(path, "w", encoding="utf-8-sig") as f:
+        with atomic_text_writer(path, encoding="utf-8-sig") as f:
             f.write("[Events]\n")
             if self.events_format:
                 f.write(self.events_format + "\n")
             else:
                 f.write("Format: " + ", ".join(EVENT_FIELDS) + "\n")
             for e in self.events:
-                f.write(e.to_ass_line() + "\n")
+                f.write(e.to_ass_line(self.events_format) + "\n")
 
 
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -294,43 +324,61 @@ def parse_ass_string(text: str) -> ASSFile:
     """Parse ASS content from a string."""
     ass = ASSFile()
     current_section = ""
+    extra_lines = None
+    known_sections = {"script info", "aegisub project garbage", "gradientgui metadata", "v4+ styles", "v4 styles", "events"}
 
-    for raw_line in text.splitlines():
+    for raw_line in text.removeprefix("\ufeff").split("\n"):
+        raw_line = raw_line.removesuffix("\r")
         line = raw_line.strip()
+
+        # Attachment encoding includes brackets and uppercase letters.
+        is_header = line.startswith("[") and line.endswith("]")
+        encoded_attachment = (
+            is_header and current_section in {"fonts", "graphics"}
+            and all(33 <= ord(char) <= 96 for char in line)
+            and line[1:-1].lower() not in known_sections | {"fonts", "graphics"}
+        )
+        if is_header and not encoded_attachment:
+            name = line[1:-1].strip()
+            current_section = name.lower()
+            extra_lines = None
+            if current_section not in known_sections:
+                extra_lines = []
+                ass._raw_sections.append((name, extra_lines))
+            continue
+
+        if extra_lines is not None:
+            extra_lines.append(raw_line)
+            continue
         if not line or line.startswith(";"):
             continue
 
-        # Section header
-        if line.startswith("[") and line.endswith("]"):
-            current_section = line[1:-1].strip()
-            continue
-
-        if current_section == "Script Info":
+        if current_section == "script info":
             k, _, v = line.partition(":")
             if v or ":" in line:
                 ass.script_info[k.strip()] = v.strip()
 
-        elif current_section in ("Aegisub Project Garbage",):
+        elif current_section == "aegisub project garbage":
             k, _, v = line.partition(":")
             if v or ":" in line:
                 ass.project_garbage[k.strip()] = v.strip()
 
-        elif current_section == "GradientGUI Metadata":
+        elif current_section == "gradientgui metadata":
             k, _, v = line.partition(":")
             if v or ":" in line:
                 ass.gradient_metadata[k.strip()] = v.strip()
 
-        elif current_section in ("V4+ Styles", "V4 Styles"):
+        elif current_section in ("v4+ styles", "v4 styles"):
             if line.startswith("Format:"):
                 ass.styles_format = line
             elif line.startswith("Style:"):
-                ass.styles.append(ASSStyle.from_line(line))
+                ass.styles.append(ASSStyle.from_line(line, ass.styles_format))
 
-        elif current_section == "Events":
+        elif current_section == "events":
             if line.startswith("Format:"):
                 ass.events_format = line
             elif line.startswith("Dialogue:") or line.startswith("Comment:"):
-                evt = ASSEvent.from_line(line)
+                evt = ASSEvent.from_line(raw_line.lstrip(" \t"), ass.events_format)
                 if evt:
                     ass.events.append(evt)
 
@@ -338,6 +386,22 @@ def parse_ass_string(text: str) -> ASSFile:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _format_fields(format_line: str, default: list[str]) -> list[str]:
+    fields = format_line.partition(":")[2].split(",") if format_line else default
+    names = [name.strip().lower() for name in fields if name.strip()]
+    return names or [name.lower() for name in default]
+
+
+def _case_insensitive_value(values: dict[str, str], name: str, default: str) -> str:
+    return next((value for key, value in reversed(list(values.items())) if key.lower() == name.lower()), default)
+
+
+def _record_values(content: str, format_line: str, default: list[str]) -> dict[str, str]:
+    names = _format_fields(format_line, default)
+    parts = content.lstrip(" \t").rstrip("\r\n").split(",", len(names) - 1)
+    return dict(zip(names, parts))
 
 def _int(s, default: int = 0) -> int:
     try:

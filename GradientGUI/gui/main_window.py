@@ -29,6 +29,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QPoint
 from PySide6.QtGui import QFont, QColor, QAction, QShortcut, QKeySequence, QDesktopServices
 
 from engine.ass_parser import ASSFile, ASSEvent, parse_ass_file, time_to_seconds
+from engine.file_io import atomic_text_writer
 from engine.tag_parser import (
     parse_tags_from_text,
     get_tag_value,
@@ -37,11 +38,12 @@ from engine.tag_parser import (
     extract_clip_bounds,
     extract_clip_tags,
 )
-from engine.interpolation import CurveNode, InterpolationMode, make_default_nodes
+from engine.interpolation import CurveNode, InterpolationMode, make_default_nodes, mirror_nodes_horizontal
 from engine.api import (
     GradientSettings,
     build_path_color_preview_stops_from_sampled_colors,
     generate_gradient,
+    implicit_static_position,
     sample_path_points_from_path,
 )
 from engine.frame_sampler import FrameSampler
@@ -75,6 +77,7 @@ from gui.settings_builder import (
     build_base_settings,
     build_event_settings,
     current_video_time,
+    initial_sampling_paths,
     resolve_video_path,
     sampling_paths_for_event,
 )
@@ -100,7 +103,7 @@ from engine.range_calc import (
     build_geometry_context as _range_build_geometry_context,
     calculate_range_plan,
     compute_dynamic_geometry_bounds as _range_compute_dynamic_geometry_bounds,
-    coord_sample_points as _range_coord_sample_points,
+    position_range,
     get_interpolated_value as _range_get_interpolated_value,
 )
 
@@ -436,6 +439,7 @@ class MainWindow(QMainWindow):
             title="动画移动曲线",
             show_sample_editor=False,
             integer_x=True,
+            pin_endpoints_to_range=False,
         )
         self._animation_curve_editor.curve_changed.connect(self._on_animation_curve_changed)
         self._animation_curve_editor.mirror_changed.connect(self._on_animation_curve_mirror_changed)
@@ -727,6 +731,7 @@ class MainWindow(QMainWindow):
 
         self._preview_cache.clear()
         with startup_profile.block("load_input.bounds_and_lines"):
+            self._sampling_paths = initial_sampling_paths(self._source_events)
             self._bounds.set_source(self._ass_file, self._source_events)
             self._line_panel.set_events(self._source_events)
 
@@ -773,20 +778,20 @@ class MainWindow(QMainWindow):
         with startup_profile.block("load_input.initial_undo"):
             self._push_undo(tr("初始状态"))
     def _load_event_tags(self, idx: int):
-        """Load tag defaults from event at given index."""
+        """Refresh unconfigured defaults without replacing shared gradients."""
         if idx < 0 or idx >= len(self._source_events):
             return
         evt = self._source_events[idx]
         parsed = parse_tags_from_text(evt.text)
         style = self._ass_file.get_style(evt.style) if self._ass_file else None
-        self._tag_panel.set_defaults_from_parsed(parsed, style)
-        if idx not in self._sampling_paths:
-            _, clips = extract_clip_tags(evt.text)
-            if clips:
-                self._sampling_paths[idx] = {
-                    tag: PathSet.from_ass_path(path)
-                    for tag, path in clips.items()
-                }
+        if "pos" not in parsed:
+            position = implicit_static_position(evt, style, self._ass_file, parsed, self._bounds.get_meta(idx))
+            if position is not None:
+                parsed["pos"] = position
+        configured_tags = {curve_key_tag(key) for key in self._tag_curves}
+        if self._active_curve_key:
+            configured_tags.add(curve_key_tag(self._active_curve_key))
+        self._tag_panel.set_defaults_from_parsed(parsed, style, preserve_tags=configured_tags)
         self._refresh_path_buttons()
         if self._last_preview_summary:
             self._show_preview_status()
@@ -858,68 +863,26 @@ class MainWindow(QMainWindow):
         self._push_undo(tr("整体范围设置"))
         self._schedule_preview()
 
-    def _sync_cached_curve_from_row(self, tag: str, row) -> None:
+    def _apply_tag_endpoint_edit(self, tag: str, row, input_index: int, axis: str) -> None:
         cfg = row.get_config()
-        if row.tag_type == "coord":
-            v_start = row._inputs[0].value()
-            v_end = row._inputs[-1].value()
-            start_xy = v_start if isinstance(v_start, tuple) else (0.0, 0.0)
-            end_xy = v_end if isinstance(v_end, tuple) else start_xy
-            for axis, idx in (("x", 0), ("y", 1)):
-                key = curve_key(tag, axis)
-                cached_nodes = self._tag_curves.get(key)
-                if cached_nodes and len(cached_nodes) >= 2:
-                    nodes = self._clone_nodes(cached_nodes)
-                else:
-                    source_nodes = cfg.nodes if axis == "x" else cfg.coord_y_nodes
-                    nodes = (
-                        self._clone_nodes(source_nodes)
-                        if source_nodes and len(source_nodes) >= 2
-                        else make_default_nodes(
-                            start_y=float(start_xy[idx]),
-                            end_y=float(end_xy[idx]),
-                        )
-                    )
-                nodes[0].y = float(start_xy[idx])
-                nodes[-1].y = float(end_xy[idx])
-                self._tag_curves[key] = nodes
-                self._tag_modes[key] = cfg.coord_y_mode if axis == "y" else cfg.mode
-            return
-
-        v_start = row._inputs[0].value()
-        v_end = row._inputs[-1].value()
-        key = curve_key(tag)
-        if row.tag_type == "color":
-            nodes = make_default_nodes(
-                start_color=str(v_start),
-                end_color=str(v_end),
-            )
-        else:
-            cached_nodes = self._tag_curves.get(key)
-            if cached_nodes and len(cached_nodes) >= 2:
-                nodes = self._clone_nodes(cached_nodes)
-            else:
-                nodes = self._clone_nodes(cfg.nodes) if cfg.nodes and len(cfg.nodes) >= 2 else []
-                if len(nodes) < 2:
-                    if row.tag_type == "text":
-                        nodes = make_default_nodes(start_y=0.0, end_y=0.0)
-                    else:
-                        nodes = make_default_nodes(
-                            start_y=float(v_start),
-                            end_y=float(v_end),
-                        )
-
+        is_coord = row.tag_type == "coord"
+        key = curve_key(tag, axis) if is_coord else curve_key(tag)
+        source_nodes = cfg.coord_y_nodes if is_coord and axis == "y" else cfg.nodes
+        nodes = self._clone_nodes(self._tag_curves.get(key) or source_nodes)
+        if len(nodes) < 2:
+            nodes = self._clone_nodes(source_nodes)
+        value = row._inputs[input_index].value()
+        if is_coord:
+            value = value[1 if axis == "y" else 0]
+        node = nodes[0 if input_index == 0 else -1]
         if row.tag_type in {"color", "text"}:
-            nodes[0].value_str = str(v_start)
-            nodes[-1].value_str = str(v_end)
+            node.value_str = str(value)
         else:
-            nodes[0].y = float(v_start)
-            nodes[-1].y = float(v_end)
-
+            node.y = float(value)
         self._tag_curves[key] = nodes
-        self._tag_modes[key] = cfg.mode
+        self._tag_modes.setdefault(key, cfg.coord_y_mode if is_coord and axis == "y" else cfg.mode)
 
-    def _on_tag_changed(self, tag: str):
+    def _on_tag_changed(self, tag: str, input_index: int = -1, axis: str = ""):
         if tag:
             self._manual_color_preview = {
                 key: value
@@ -930,8 +893,8 @@ class MainWindow(QMainWindow):
             self._manual_color_preview.clear()
         self._sync_tabs()
         row = self._tag_panel.get_row(tag)
-        if row and not getattr(row, '_syncing', False):
-            self._sync_cached_curve_from_row(tag, row)
+        if row and input_index >= 0 and not getattr(row, '_syncing', False):
+            self._apply_tag_endpoint_edit(tag, row, input_index, axis)
 
             if tag == self._active_tag and self._active_curve_key:
                 nodes = self._tag_curves.get(self._active_curve_key)
@@ -958,7 +921,7 @@ class MainWindow(QMainWindow):
                         )
                 finally:
                     self._syncing_curve_editor = False
-        if tag in {"1c", "2c", "3c", "4c"} and tag == curve_key_tag(self._active_curve_key):
+        if not tag or (tag in {"1c", "2c", "3c", "4c"} and tag == curve_key_tag(self._active_curve_key)):
             self._update_curve_color_preview()
         self._sync_tag_overview(save_active=False)
         self._schedule_preview()
@@ -1091,14 +1054,12 @@ class MainWindow(QMainWindow):
         video_path = self._resolve_video_path()
         evt = self._get_active_event()
         frame_image = None
-        loaded_frame_key = None
         preview_frame = self._current_preview_video_frame()
         if video_path and evt:
             if self._load_path_preview_frame(video_path, evt):
                 frame_image = self._path_frame_sampler.get_image_copy()
-                loaded_frame_key = self._path_frame_sampler.frame_cache_key()
 
-        active_paths = self._sampling_paths.setdefault(self._active_event_idx, {})
+        active_paths = self._sampling_paths.get(self._active_event_idx, {})
         if tag in active_paths:
             initial_path = active_paths[tag].to_ass_path()
         elif evt:
@@ -1124,70 +1085,56 @@ class MainWindow(QMainWindow):
         if result != PathSamplerDialog.DialogCode.Accepted:
             return
 
-        if dialog.remove_requested:
-            # This explicit removal suppresses any original xlip path that may
-            # already exist in the source ASS line.
-            active_paths[tag] = PathSet.removed()
-            self._reset_color_tag_after_path_removed(tag)
-            if self._last_preview_summary:
-                self._show_preview_status()
-            else:
-                self._status.showMessage(f"{tr('已移除')} \\{tag} {tr('路径采色')}")
-        else:
-            sample_frame = dialog.sampling_frame_number
-            if sample_frame is None or sample_frame < 0:
-                sample_frame = preview_frame if preview_frame >= 0 else None
-            sampled_path = dialog.path()
-            if not sampled_path.strip():
-                active_paths[tag] = PathSet.removed()
-                self._reset_color_tag_after_path_removed(tag)
-                if self._last_preview_summary:
-                    self._show_preview_status()
-                else:
-                    self._status.showMessage(f"{tr('已清空')} \\{tag} {tr('路径采色')}")
-                self._refresh_path_buttons()
-                self._sync_tag_overview(save_active=False)
-                self._push_undo(f"路径采色 \\{tag}")
-                self._schedule_preview()
-                return
-            path_state = PathSet.from_ass_path(
-                sampled_path,
-                sampling_frame=sample_frame,
-            )
-            path_state.sampled_points = self._sample_path_points(
-                sampled_path,
-                sample_frame,
-                frame_image=frame_image,
-                frame_key=loaded_frame_key,
-            )
-            active_paths[tag] = path_state
-            self._reset_color_tag_curve_to_source_default(tag)
-            for target_tag, target_path in dialog.applied_paths.items():
-                target_state = PathSet.from_ass_path(
-                    target_path,
-                    sampling_frame=sample_frame,
+        sample_frame = dialog.sampling_frame_number
+        if sample_frame is None or sample_frame < 0:
+            sample_frame = preview_frame if preview_frame >= 0 else None
+        requested_paths = {tag: "" if dialog.remove_requested else dialog.path()}
+        requested_paths.update(dialog.applied_paths)
+
+        # Capture every target before committing any path, curve, or tag toggle.
+        # The dialog's frame snapshot is authoritative; never reload on save.
+        updates = {}
+        try:
+            for target_tag, target_path in requested_paths.items():
+                if not target_path.strip():
+                    updates[target_tag] = PathSet.removed()
+                    continue
+                if frame_image is None:
+                    raise ValueError(tr("无法读取当前帧"))
+                samples = self._sample_path_points(target_path, frame_image=frame_image)
+                if not samples:
+                    raise ValueError(f"\\{target_tag}: {tr('路径未采集到有效像素。')}")
+                updates[target_tag] = PathSet.from_ass_path(
+                    target_path, sampling_frame=sample_frame, sampled_points=samples,
                 )
-                target_state.sampled_points = self._sample_path_points(
-                    target_path,
-                    sample_frame,
-                    frame_image=frame_image,
-                    frame_key=loaded_frame_key,
-                )
-                active_paths[target_tag] = target_state
+        except Exception as error:
+            QMessageBox.warning(
+                self, tr("路径采色"),
+                f"{tr('路径修改未保存，已有采色结果保持不变。')}\n{error}",
+            )
+            return
+
+        self._sampling_paths.setdefault(self._active_event_idx, {}).update(updates)
+        for target_tag, path_state in updates.items():
+            if path_state.is_active:
                 self._reset_color_tag_curve_to_source_default(target_tag)
-                target_row = self._tag_panel.get_row(target_tag)
-                if target_row:
-                    target_row.set_enabled_checked(True)
-            row = self._tag_panel.get_row(tag)
-            if row:
-                row.set_enabled_checked(True)
-            self._on_tag_selected(tag)
-            if self._last_preview_summary:
-                self._show_preview_status()
+                row = self._tag_panel.get_row(target_tag)
+                if row:
+                    row.set_enabled_checked(True)
             else:
-                self._status.showMessage(f"{tr('已设置')} \\{tag} {tr('路径采色')}")
+                self._reset_color_tag_after_path_removed(target_tag)
+        self._sync_tabs()
+        if updates[tag].is_active:
+            self._on_tag_selected(tag)
+
+        if self._last_preview_summary:
+            self._show_preview_status()
+        else:
+            action = tr("已设置") if updates[tag].is_active else tr("已移除")
+            self._status.showMessage(f"{action} \\{tag} {tr('路径采色')}")
 
         self._refresh_path_buttons()
+        self._update_curve_color_preview()
         self._sync_tag_overview(save_active=False)
         self._push_undo(f"路径采色 \\{tag}")
         self._schedule_preview()
@@ -1256,37 +1203,23 @@ class MainWindow(QMainWindow):
     def _sample_path_points(
         self,
         path: str,
-        frame_number: int | None,
         *,
-        frame_image=None,
-        frame_key=None,
+        frame_image,
     ) -> list[tuple[int, int, int, str]]:
-        video_path = self._resolve_video_path()
-        if not video_path or not path.strip():
-            return []
-        pixel_getter = self._path_frame_sampler.get_pixel_bgr
-        if frame_image is not None:
-            width, height = frame_image.size
+        if frame_image is None:
+            raise ValueError(tr("无法读取当前帧"))
+        if frame_image.mode != "RGB":
+            frame_image = frame_image.convert("RGB")
+        width, height = frame_image.size
+        if width <= 0 or height <= 0:
+            raise ValueError(tr("无法读取当前帧"))
 
-            def pixel_getter(x: int, y: int) -> str | None:
-                x = max(0, min(width - 1, int(x)))
-                y = max(0, min(height - 1, int(y)))
-                try:
-                    r, g, b = frame_image.getpixel((x, y))
-                    return f"{b:02X}{g:02X}{r:02X}"
-                except Exception:
-                    return None
+        def pixel_getter(x: int, y: int) -> str:
+            x = max(0, min(width - 1, int(x)))
+            y = max(0, min(height - 1, int(y)))
+            r, g, b = frame_image.getpixel((x, y))
+            return f"{b:02X}{g:02X}{r:02X}"
 
-        else:
-            if frame_number is None:
-                return []
-            frame_number = int(frame_number)
-            fast_time = frame_number / max(self._preview_fps(), 1.0)
-            if not (
-                self._path_frame_sampler.load_frame(video_path, fast_time)
-                or self._path_frame_sampler.load_frame_number(video_path, frame_number)
-            ):
-                return []
         return sample_path_points_from_path(path, pixel_getter)
 
     def _project_path_sample_colors(self, path_set: PathSet) -> list[tuple[int, str]]:
@@ -1299,6 +1232,7 @@ class MainWindow(QMainWindow):
         return []
 
     def _update_curve_color_preview(self):
+        self._curve_editor.set_color_space(self._tag_panel.get_color_space())
         key = self._active_curve_key
         tag = curve_key_tag(key)
         if tag not in {"1c", "2c", "3c", "4c"}:
@@ -1364,6 +1298,8 @@ class MainWindow(QMainWindow):
 
         nodes = self._color_stops_to_nodes(stops)
         key = self._active_curve_key or tag
+        if self._curve_mirrors.get(key, (False, False))[0]:
+            nodes = mirror_nodes_horizontal(nodes)
         self._tag_curves[key] = nodes
         self._tag_modes[key] = InterpolationMode.LINEAR
 
@@ -1416,15 +1352,15 @@ class MainWindow(QMainWindow):
         clean: list[tuple[float, str]] = []
         for pos, color in sorted(stops, key=lambda item: item[0]):
             x = max(0.0, min(100.0, float(pos) * 100.0))
-            if clean and abs(clean[-1][0] - x) < 0.001:
+            if clean and clean[-1][0] == x:
                 clean[-1] = (x, color)
             else:
                 clean.append((x, color))
         if not clean:
             clean = [(0.0, "FFFFFF"), (100.0, "FFFFFF")]
-        if clean[0][0] > 0.001:
+        if clean[0][0] > 0.0:
             clean.insert(0, (0.0, clean[0][1]))
-        if clean[-1][0] < 99.999:
+        if clean[-1][0] < 100.0:
             clean.append((100.0, clean[-1][1]))
 
         nodes: list[CurveNode] = []
@@ -1510,8 +1446,10 @@ class MainWindow(QMainWindow):
         if not video_path or not evt:
             return False
         marker = (str(video_path), int(self._current_preview_video_frame()))
+        frame_key = self._path_frame_sampler.frame_cache_key()
         if (
-            getattr(self, "_color_picker_frame_marker", None) == marker
+            frame_key is not None
+            and getattr(self, "_color_picker_frame_marker", None) == (marker, frame_key)
             and self._path_frame_sampler.image_size()
         ):
             return True
@@ -1520,7 +1458,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_color_picker_frame_failed_marker", None) == marker:
             return False
         if self._load_path_preview_frame(video_path, evt):
-            self._color_picker_frame_marker = marker
+            self._color_picker_frame_marker = (marker, self._path_frame_sampler.frame_cache_key())
             self._color_picker_frame_failed_marker = None
             return True
         self._color_picker_frame_failed_marker = marker
@@ -2053,27 +1991,11 @@ class MainWindow(QMainWindow):
         if not self._active_curve_key:
             return
         nodes = self._curve_editor.get_nodes()
-        self._tag_curves[self._active_curve_key] = [
-            CurveNode(
-                x=n.x, y=n.y, value_str=n.value_str,
-                handle_in_x=n.handle_in_x, handle_in_y=n.handle_in_y,
-                handle_out_x=n.handle_out_x, handle_out_y=n.handle_out_y,
-                segment_mode=n.segment_mode,
-            )
-            for n in nodes
-        ]
+        self._tag_curves[self._active_curve_key] = self._clone_nodes(nodes)
         self._tag_modes[self._active_curve_key] = self._curve_editor.get_mode()
 
     def _clone_nodes(self, nodes: list[CurveNode]) -> list[CurveNode]:
-        return [
-            CurveNode(
-                x=n.x, y=n.y, value_str=n.value_str,
-                handle_in_x=n.handle_in_x, handle_in_y=n.handle_in_y,
-                handle_out_x=n.handle_out_x, handle_out_y=n.handle_out_y,
-                segment_mode=n.segment_mode,
-            )
-            for n in nodes
-        ]
+        return [copy.copy(node) for node in nodes]
 
     def _active_animation_tag(self) -> Optional[str]:
         if not self._active_curve_key:
@@ -2134,6 +2056,8 @@ class MainWindow(QMainWindow):
     def _save_active_animation_panel_state(self) -> None:
         if not hasattr(self, "_animation_panel"):
             return
+        if not self._animation_panel.has_active_tag():
+            return
         tag = self._active_animation_tag()
         if not tag:
             return
@@ -2188,25 +2112,12 @@ class MainWindow(QMainWindow):
         n1.handle_out_y = 1.0
         return [n0, n1]
 
-    def _normalize_animation_curve_nodes(self, nodes: list[CurveNode]) -> list[CurveNode]:
-        x_max = self._animation_curve_x_max()
+    def _animation_curve_nodes(self, nodes: list[CurveNode]) -> list[CurveNode]:
+        # Stored positions are relative frame numbers, not normalized percentages.
         cloned = self._clone_nodes(nodes) if nodes else self._default_animation_curve_nodes()
         cloned.sort(key=lambda n: n.x)
         if len(cloned) < 2:
             return self._default_animation_curve_nodes()
-        old_max = max(cloned[-1].x, 1.0)
-        if abs(old_max - x_max) > 1e-6:
-            factor = x_max / old_max
-            for node in cloned:
-                node.x *= factor
-                node.handle_in_x *= factor
-                node.handle_out_x *= factor
-        for node in cloned:
-            node.x = float(round(max(0.0, min(x_max, node.x))))
-            node.handle_in_x = float(round(max(0.0, min(x_max, node.handle_in_x))))
-            node.handle_out_x = float(round(max(0.0, min(x_max, node.handle_out_x))))
-        cloned[0].x = 0.0
-        cloned[-1].x = x_max
         return cloned
 
     def _sync_animation_curve_editor(self):
@@ -2223,14 +2134,19 @@ class MainWindow(QMainWindow):
             self._sync_animation_overview(save_active=False)
             return
 
-        nodes = self._normalize_animation_curve_nodes(
+        nodes = self._animation_curve_nodes(
             self._animation_curves.get(tag, [])
         )
         mode = self._animation_modes.get(tag, InterpolationMode.LINEAR)
         self._syncing_animation_editor = True
         try:
             self._animation_curve_editor.setEnabled(True)
-            self._animation_curve_editor.set_x_max(self._animation_curve_x_max())
+            self._animation_curve_editor.set_x_max(max(
+                self._animation_curve_x_max(), max(node.x for node in nodes),
+            ))
+            self._animation_curve_editor.view.set_active_x_max(
+                max(0, self._active_event_total_frames() - 1)
+            )
             extent = self._animation_curve_y_extent()
             self._animation_curve_editor.set_y_range(-extent, extent)
             self._animation_curve_editor.set_nodes(nodes, is_color=False, is_text=False)
@@ -2285,7 +2201,7 @@ class MainWindow(QMainWindow):
                     if tag not in animated_tag_set
                     else (r"\t" if can_use_transform else "split")
                 ),
-                nodes=self._normalize_animation_curve_nodes(
+                nodes=self._animation_curve_nodes(
                     self._animation_curves.get(tag, [])
                 ),
                 mode=self._animation_modes.get(tag, InterpolationMode.LINEAR),
@@ -2976,18 +2892,7 @@ class MainWindow(QMainWindow):
         render_x: float,
         render_y: float,
     ):
-        cfg = enabled_tags.get("pos")
-        if cfg and getattr(cfg, "nodes", None):
-            xs: list[float] = []
-            ys: list[float] = []
-            for t in _range_coord_sample_points(cfg):
-                value = _range_get_interpolated_value("pos", cfg, t, parsed, style, settings)
-                if isinstance(value, tuple) and len(value) >= 2:
-                    xs.append(float(value[0]))
-                    ys.append(float(value[1]))
-            if xs and ys:
-                return min(xs), max(xs), min(ys), max(ys)
-        return render_x, render_x, render_y, render_y
+        return position_range(enabled_tags, parsed, style, settings, (render_x, render_y))
 
     # ── Undo / Redo ──────────────────────────────────────────────────────
 
@@ -3064,9 +2969,9 @@ class MainWindow(QMainWindow):
             if result is None:
                 return
             path, state_data = result
+            state = state_codec.state_from_preset_data(state_data)
             if not self._confirm_preset_load(path, state_data):
                 return
-            state = state_codec.state_from_preset_data(state_data)
         except Exception as e:
             QMessageBox.critical(self, tr("加载预设失败"), str(e))
             return
@@ -3080,7 +2985,11 @@ class MainWindow(QMainWindow):
 
         self._flush_pending_undo()
         self._push_undo(tr("加载预设前"))
-        self._restore_state(state)
+        try:
+            self._restore_state(state)
+        except Exception as e:
+            QMessageBox.critical(self, tr("加载预设失败"), str(e))
+            return
         self._last_undo_signature = None
         self._push_undo(f"加载预设: {Path(path).stem}")
         preset_io.remember_recent_preset(path)
@@ -3090,9 +2999,9 @@ class MainWindow(QMainWindow):
     def _load_recent_preset(self, path: str):
         try:
             state_data = preset_io.read_preset(path)
+            state = state_codec.state_from_preset_data(state_data)
             if not self._confirm_preset_load(path, state_data):
                 return
-            state = state_codec.state_from_preset_data(state_data)
         except Exception as e:
             QMessageBox.critical(self, tr("加载预设失败"), str(e))
             self._refresh_recent_presets_menu()
@@ -3106,7 +3015,11 @@ class MainWindow(QMainWindow):
 
         self._flush_pending_undo()
         self._push_undo(tr("加载预设前"))
-        self._restore_state(state)
+        try:
+            self._restore_state(state)
+        except Exception as e:
+            QMessageBox.critical(self, tr("加载预设失败"), str(e))
+            return
         self._last_undo_signature = None
         self._push_undo(f"加载预设: {Path(path).stem}")
         preset_io.remember_recent_preset(path)
@@ -3255,7 +3168,7 @@ class MainWindow(QMainWindow):
 
         try:
             report = self._build_debug_report()
-            with open(path, "w", encoding="utf-8") as f:
+            with atomic_text_writer(path) as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
             self._status.showMessage(f"{tr('已导出调试包')}: {path}")
         except Exception as e:
@@ -3357,11 +3270,22 @@ class MainWindow(QMainWindow):
 
     def _restore_state(self, state: UndoState):
         """Restore UI from an UndoState."""
+        previous_state = self._capture_state()
         if self._undo_timer.isActive():
             self._undo_timer.stop()
         previous_undo_suspended = self._undo_suspended
         self._undo_suspended = True
+        try:
+            self._apply_restored_state(state)
+        except Exception:
+            self._apply_restored_state(previous_state)
+            raise
+        finally:
+            self._undo_suspended = previous_undo_suspended
 
+    def _apply_restored_state(self, state: UndoState):
+        """Apply a snapshot while the caller owns undo suspension and rollback."""
+        state = state_codec.split_coordinate_state(state)
         state_codec.restore_tag_panel_configs(self._tag_panel, state.tag_configs)
 
         self._tag_curves = state_codec.deserialize_curve_store(state.tag_curves)
@@ -3379,7 +3303,6 @@ class MainWindow(QMainWindow):
         self._sampling_paths = normalize_path_state(
             getattr(state, "sampling_paths", {})
         )
-        self._refresh_path_buttons()
 
         # Restore mode/angle/step without fanning out extra change signals.
         restore_widgets = [
@@ -3455,7 +3378,6 @@ class MainWindow(QMainWindow):
                     if tag in TAG_INFO
                 }
         self._animation_seam_blend_lengths = seam_lengths
-        self._animation_panel.restore_state(animation_state)
         saved_group_tags = getattr(state, "group_range_tags", None)
         self._group_range_tags = (
             set(saved_group_tags)
@@ -3474,52 +3396,44 @@ class MainWindow(QMainWindow):
             getattr(state, "reference_lines", []),
             len(self._source_events),
         )
+        self._refresh_path_buttons()
+        self._animation_panel.set_frame_range(self._active_event_total_frames())
+        self._animation_panel.restore_state(animation_state)
 
         saved_curve_key = getattr(state, "active_curve_key", "") or self._active_curve_key
-        self._active_curve_key = saved_curve_key
-        self._active_tag = curve_key_tag(saved_curve_key)
+        enabled_keys = [
+            key
+            for tag in self._tag_panel.get_enabled_tags()
+            for key in curve_keys_for_tag(tag)
+        ]
+        # Load fresh editors before tab/overview synchronization can save them.
+        self._active_curve_key = None
+        self._active_tag = None
+        if enabled_keys:
+            key = saved_curve_key if saved_curve_key in enabled_keys else enabled_keys[0]
+            self._on_curve_key_selected(key)
         self._sync_tabs()
-
-        # Reload active curve
-        if self._active_curve_key and self._active_curve_key in self._tag_curves:
-            tag = curve_key_tag(self._active_curve_key) or self._active_curve_key
-            tag_info = TAG_INFO.get(tag, {})
-            tag_type = tag_info.get("type")
-            is_color = tag_type == "color"
-            is_text = tag_type == "text"
-            self._curve_editor.set_value_precision(
-                int(tag_info.get("precision", 2)),
-                float(tag_info.get("input_step", 0.1)),
-            )
-            self._curve_editor.set_nodes(
-                self._tag_curves[self._active_curve_key], is_color, is_text
-            )
-            self._curve_editor.set_mode(
-                self._tag_modes.get(self._active_curve_key, InterpolationMode.LINEAR)
-            )
-            self._curve_editor.set_mirror_state(
-                *self._curve_mirrors.get(self._active_curve_key, (False, False))
-            )
-            self._update_curve_color_preview()
-            self._sync_animation_curve_editor()
 
         self._last_undo_signature = self._state_signature(state)
         self._schedule_preview()
-        self._undo_suspended = previous_undo_suspended
 
     def _do_undo(self):
-        self._flush_pending_undo()
-        state = self._undo.undo()
-        if state:
-            self._restore_state(state)
-            self._status.showMessage(f"{tr('撤销')}: {state.description}")
+        self._restore_history(redo=False)
 
     def _do_redo(self):
+        self._restore_history(redo=True)
+
+    def _restore_history(self, *, redo: bool):
         self._flush_pending_undo()
-        state = self._undo.redo()
+        move = self._undo.redo if redo else self._undo.undo
+        try:
+            state = move(restore=self._restore_state)
+        except Exception as error:
+            QMessageBox.critical(self, tr("重做失败" if redo else "撤销失败"), str(error))
+            return
         if state:
-            self._restore_state(state)
-            self._status.showMessage(f"{tr('重做')}: {state.description}")
+            action = tr("重做" if redo else "撤销")
+            self._status.showMessage(f"{action}: {state.description}")
 
     def _update_undo_buttons(self):
         self._undo_btn.setEnabled(self._undo.can_undo)

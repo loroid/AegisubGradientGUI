@@ -7,7 +7,7 @@ from typing import Optional
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap,
+    QBrush, QColor, QImage, QPainter, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QGraphicsEllipseItem, QGraphicsPathItem,
@@ -17,13 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.i18n import tr
-
-
-def _fmt_num(value: float) -> str:
-    rounded = round(value, 1)
-    if abs(rounded - round(rounded)) < 1e-6:
-        return str(int(round(rounded)))
-    return f"{rounded:.1f}"
+from gui.path_geometry import EditablePath, parse_editable_paths
 
 
 def _pil_to_pixmap(image) -> QPixmap:
@@ -33,83 +27,6 @@ def _pil_to_pixmap(image) -> QPixmap:
     return QPixmap.fromImage(qimg.copy())
 
 
-def _parse_path_segments(path: str) -> list[list[QPointF]]:
-    tokens = path.split()
-    paths: list[list[QPointF]] = []
-    current: list[QPointF] = []
-    i = 0
-    cmd: Optional[str] = None
-
-    def append_point(x: float, y: float) -> None:
-        nonlocal current
-        if not current:
-            current = []
-            paths.append(current)
-        current.append(QPointF(x, y))
-
-    while i < len(tokens):
-        tok = tokens[i].lower()
-        if tok in {"m", "n", "l", "b"}:
-            cmd = tok
-            i += 1
-            if cmd in {"m", "n"} and i + 1 < len(tokens):
-                try:
-                    current = [QPointF(float(tokens[i]), float(tokens[i + 1]))]
-                    paths.append(current)
-                    i += 2
-                except ValueError:
-                    pass
-            continue
-        try:
-            if cmd in {"m", "n", "l"} and i + 1 < len(tokens):
-                append_point(float(tokens[i]), float(tokens[i + 1]))
-                i += 2
-            elif cmd == "b" and i + 5 < len(tokens):
-                append_point(float(tokens[i + 4]), float(tokens[i + 5]))
-                i += 6
-            else:
-                i += 1
-        except ValueError:
-            i += 1
-    return [path_points for path_points in paths if path_points]
-
-
-def _bezier_controls(points: list[QPointF]) -> list[tuple[QPointF, QPointF, QPointF]]:
-    segments: list[tuple[QPointF, QPointF, QPointF]] = []
-    if len(points) < 2:
-        return segments
-
-    for i in range(len(points) - 1):
-        p0 = points[i - 1] if i > 0 else points[i]
-        p1 = points[i]
-        p2 = points[i + 1]
-        p3 = points[i + 2] if i + 2 < len(points) else p2
-        c1 = QPointF(p1.x() + (p2.x() - p0.x()) / 6.0, p1.y() + (p2.y() - p0.y()) / 6.0)
-        c2 = QPointF(p2.x() - (p3.x() - p1.x()) / 6.0, p2.y() - (p3.y() - p1.y()) / 6.0)
-        segments.append((c1, c2, p2))
-    return segments
-
-
-def points_to_ass_path(points: list[QPointF]) -> str:
-    if not points:
-        return ""
-    parts = ["m", _fmt_num(points[0].x()), _fmt_num(points[0].y())]
-    for c1, c2, end in _bezier_controls(points):
-        parts.extend([
-            "b",
-            _fmt_num(c1.x()), _fmt_num(c1.y()),
-            _fmt_num(c2.x()), _fmt_num(c2.y()),
-            _fmt_num(end.x()), _fmt_num(end.y()),
-        ])
-    return " ".join(parts)
-
-
-def paths_to_ass_path(paths: list[list[QPointF]]) -> str:
-    return " ".join(
-        part for part in (points_to_ass_path(points) for points in paths) if part
-    )
-
-
 class PathCanvas(QGraphicsView):
     changed = Signal()
 
@@ -117,7 +34,7 @@ class PathCanvas(QGraphicsView):
         self,
         pixmap: Optional[QPixmap],
         canvas_size: tuple[int, int],
-        paths: Optional[list[list[QPointF]]] = None,
+        paths: Optional[list[EditablePath]] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -132,6 +49,8 @@ class PathCanvas(QGraphicsView):
         self._paths = paths or []
         self._active_path = 0
         self._drag_ref: Optional[tuple[int, int]] = None
+        self._drag_start_pos = QPointF()
+        self._drag_path_origin: Optional[EditablePath] = None
         self._view_zoom = 1.0
         self._panning = False
         self._pan_start = None
@@ -185,7 +104,7 @@ class PathCanvas(QGraphicsView):
     def points(self) -> list[QPointF]:
         if not self._paths:
             return []
-        return list(self._paths[self._active_path])
+        return [QPointF(point) for point in self._paths[self._active_path].points]
 
     def path_count(self) -> int:
         return len(self._paths)
@@ -195,15 +114,15 @@ class PathCanvas(QGraphicsView):
         return self._active_path
 
     def path_strings(self) -> list[str]:
-        return [points_to_ass_path(points) for points in self._paths]
+        return [path.to_ass_path() for path in self._paths]
 
     def current_path_string(self) -> str:
         if not self._paths:
             return ""
-        return points_to_ass_path(self._paths[self._active_path])
+        return self._paths[self._active_path].to_ass_path()
 
     def current_path_is_valid(self) -> bool:
-        return bool(self._paths and len(self._paths[self._active_path]) >= 2)
+        return bool(self._paths and len(self._paths[self._active_path].points) >= 2)
 
     def set_active_path(self, index: int) -> None:
         if not self._paths:
@@ -217,28 +136,30 @@ class PathCanvas(QGraphicsView):
         self.changed.emit()
 
     def set_points(self, points: list[QPointF]) -> None:
-        self._paths = [points] if points else []
+        self._paths = [EditablePath(points)] if points else []
         self._active_path = 0
         self._drag_ref = None
         self._redraw()
         self.changed.emit()
 
     def total_point_count(self) -> int:
-        return sum(len(points) for points in self._paths)
+        return sum(len(path.points) for path in self._paths)
 
     def has_valid_path(self) -> bool:
-        return any(len(points) >= 2 for points in self._paths)
+        return any(len(path.points) >= 2 for path in self._paths)
 
     def ass_path(self) -> str:
-        return paths_to_ass_path(self._paths)
+        return " ".join(path.to_ass_path() for path in self._paths if path.points)
 
     def valid_ass_path(self) -> str:
-        return paths_to_ass_path([points for points in self._paths if len(points) >= 2])
+        return " ".join(path.to_ass_path() for path in self._paths if len(path.points) >= 2)
 
     def undo_point(self) -> None:
-        if self._paths and self._paths[self._active_path]:
-            self._paths[self._active_path].pop()
-            if not self._paths[self._active_path] and len(self._paths) > 1:
+        if self._paths and self._paths[self._active_path].points:
+            path = self._paths[self._active_path]
+            path.remove_point(len(path.points) - 1)
+            self._drag_ref = None
+            if not path.points and len(self._paths) > 1:
                 self._paths.pop(self._active_path)
                 self._active_path = max(0, min(self._active_path, len(self._paths) - 1))
             self._redraw()
@@ -247,11 +168,12 @@ class PathCanvas(QGraphicsView):
     def clear_points(self) -> None:
         self._paths.clear()
         self._active_path = 0
+        self._drag_ref = None
         self._redraw()
         self.changed.emit()
 
     def add_path(self) -> None:
-        self._paths.append([])
+        self._paths.append(EditablePath())
         self._active_path = len(self._paths) - 1
         self._drag_ref = None
         self._redraw()
@@ -299,6 +221,7 @@ class PathCanvas(QGraphicsView):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
+            self._drag_ref = None
             self._panning = True
             self._pan_start = event.position()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -310,8 +233,9 @@ class PathCanvas(QGraphicsView):
                 ref = self._nearest_point_ref(pos)
                 if ref is not None:
                     path_idx, point_idx = ref
-                    self._paths[path_idx].pop(point_idx)
-                    if not self._paths[path_idx] and len(self._paths) > 1:
+                    self._paths[path_idx].remove_point(point_idx)
+                    self._drag_ref = None
+                    if not self._paths[path_idx].points and len(self._paths) > 1:
                         self._paths.pop(path_idx)
                     self._active_path = max(0, min(path_idx, len(self._paths) - 1))
                     self._redraw()
@@ -325,13 +249,16 @@ class PathCanvas(QGraphicsView):
             ref = self._nearest_point_ref(pos)
             if ref is None:
                 if not self._paths:
-                    self._paths.append([])
+                    self._paths.append(EditablePath())
                     self._active_path = 0
-                self._paths[self._active_path].append(pos)
-                ref = (self._active_path, len(self._paths[self._active_path]) - 1)
+                self._paths[self._active_path].append_point(pos)
+                ref = (self._active_path, len(self._paths[self._active_path].points) - 1)
             else:
                 self._active_path = ref[0]
             self._drag_ref = ref
+            self._drag_start_pos = self.mapToScene(event.position().toPoint())
+            geometry = self._paths[ref[0]]
+            self._drag_path_origin = EditablePath(geometry.points, geometry.controls, geometry.move_command)
             self._redraw()
             self.changed.emit()
             event.accept()
@@ -351,11 +278,19 @@ class PathCanvas(QGraphicsView):
             event.accept()
             return
         if self._drag_ref is not None:
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                self._drag_ref = None
+                super().mouseMoveEvent(event)
+                return
             path_idx, point_idx = self._drag_ref
-            if 0 <= path_idx < len(self._paths) and 0 <= point_idx < len(self._paths[path_idx]):
-                self._paths[path_idx][point_idx] = self._clamped_scene_pos(event.position().toPoint())
-            self._redraw()
-            self.changed.emit()
+            if 0 <= path_idx < len(self._paths) and 0 <= point_idx < len(self._paths[path_idx].points):
+                delta = self.mapToScene(event.position().toPoint()) - self._drag_start_pos
+                point = self._drag_path_origin.points[point_idx] + delta
+                if self._paths[path_idx].move_point(
+                    point_idx, self._clamp_point(point), origin=self._drag_path_origin,
+                ):
+                    self._redraw()
+                    self.changed.emit()
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -378,7 +313,9 @@ class PathCanvas(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def _clamped_scene_pos(self, view_pos) -> QPointF:
-        p = self.mapToScene(view_pos)
+        return self._clamp_point(self.mapToScene(view_pos))
+
+    def _clamp_point(self, p: QPointF) -> QPointF:
         return QPointF(
             max(0.0, min(float(self._width - 1), p.x())),
             max(0.0, min(float(self._height - 1), p.y())),
@@ -391,8 +328,8 @@ class PathCanvas(QGraphicsView):
         threshold = 12.0 / scale
         best_ref: Optional[tuple[int, int]] = None
         best_dist = threshold
-        for path_idx, points in enumerate(self._paths):
-            for point_idx, point in enumerate(points):
+        for path_idx, path in enumerate(self._paths):
+            for point_idx, point in enumerate(path.points):
                 dist = math.hypot(point.x() - pos.x(), point.y() - pos.y())
                 if dist <= best_dist:
                     best_dist = dist
@@ -404,20 +341,17 @@ class PathCanvas(QGraphicsView):
             self._scene.removeItem(item)
         self._items.clear()
 
-        for path_idx, points in enumerate(self._paths):
-            if not points:
+        for path_idx, geometry in enumerate(self._paths):
+            if not geometry.points:
                 continue
-            path = QPainterPath(points[0])
-            for c1, c2, end in _bezier_controls(points):
-                path.cubicTo(c1, c2, end)
-            path_item = QGraphicsPathItem(path)
+            path_item = QGraphicsPathItem(geometry.painter_path())
             color = QColor("#ff5a5f") if path_idx == self._active_path else QColor("#8a7cff")
             path_item.setPen(QPen(color, 3.0))
             path_item.setZValue(10)
             self._scene.addItem(path_item)
             self._items.append(path_item)
 
-            for point in points:
+            for point in geometry.points:
                 radius = 5.0
                 item = QGraphicsEllipseItem(
                     -radius, -radius, radius * 2.0, radius * 2.0
@@ -459,7 +393,7 @@ class PathSamplerDialog(QDialog):
         self._syncing_path_list = False
 
         pixmap = _pil_to_pixmap(frame_image) if frame_image is not None else None
-        paths = _parse_path_segments(initial_path)
+        paths = parse_editable_paths(initial_path)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
